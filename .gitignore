@@ -1,0 +1,25 @@
+# Raw datasets (download separately)
+Fire/data/Prevention/raw/*
+!Fire/data/Prevention/raw/.gitkeep
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Credentials
+*.json
+.env
+credentials/
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
