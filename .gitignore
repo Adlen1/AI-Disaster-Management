@@ -1,25 +1,39 @@
-# Raw datasets (download separately)
+# ==========================
+# Raw datasets
+# ==========================
 Fire/data/Prevention/raw/*
-!Fire/data/Prevention/raw/.gitkeep
+Fire/data/Response/raw/*
+Fire/data/Recovery/raw/*
 
+!Fire/data/Prevention/raw/.gitkeep
+!Fire/data/Response/raw/.gitkeep
+!Fire/data/Recovery/raw/.gitkeep
+# ==========================
 # Python virtual environments
+# ==========================
 .venv/
 venv/
 env/
-
-# Credentials
-*.json
+# ==========================
+# Environment & credentials
+# ==========================
 .env
 credentials/
-
+credentials.json
+config.py
+# ==========================
 # Python
+# ==========================
 __pycache__/
 *.py[cod]
+# Jupyter
 .ipynb_checkpoints/
-
+# ==========================
 # VS Code
+# ==========================
 .vscode/
-
+# ==========================
 # OS
+# ==========================
 .DS_Store
 Thumbs.db

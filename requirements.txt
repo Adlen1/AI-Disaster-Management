@@ -1,5 +1,8 @@
-pandas
 numpy
-openpyxl
-jupyter
+pandas
 matplotlib
+requests
+jupyter
+ipykernel
+python-dotenv
+openpyxl
