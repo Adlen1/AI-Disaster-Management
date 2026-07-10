@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from utils.base import DataSource
+from utils.grid import get_algeria_grid
 
 
 def compute_slope_aspect(elevation: np.ndarray, resolution_m: float):
@@ -119,14 +120,8 @@ class DEMSource(DataSource):
             )
 
         # ── 3. Reproject to EPSG:4326 at target resolution ───────────────────
-        target_res_deg = target_res_m / 111000  # approximate degrees
-
-        bounds = rasterio.transform.array_bounds(
-            clipped.shape[0], clipped.shape[1], clip_transform
-        )
-        new_width  = int((bounds[2] - bounds[0]) / target_res_deg)
-        new_height = int((bounds[3] - bounds[1]) / target_res_deg)
-        new_transform = from_bounds(*bounds, new_width, new_height)
+        
+        new_transform, new_width, new_height, bounds = get_algeria_grid(boundary_path)
 
         elevation_resampled = np.full(
             (new_height, new_width), np.nan, dtype=np.float32
