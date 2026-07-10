@@ -1,0 +1,78 @@
+# Central config — all paths, parameters, API keys loaded from here
+
+paths:
+  raw_root:     data/raw
+  curated_root: data/curated
+  integrated:   data/integrated
+  logs:         logs/
+
+algeria:
+  bbox:         [-8.67, 18.96, 11.99, 37.09]   # [west, south, east, north]
+  crs:          "EPSG:4326"
+  grid_resolution_km: 5                          # spatial grid cell size
+
+gadm:
+  paths:
+    raw:     data/raw/boundaries
+    curated: data/curated/boundaries
+  filename_gpkg: "gadm41_DZA.gpkg"
+  admin_levels:
+    - 0   # country
+    - 1   # wilaya (48 wilayas)
+
+dem:
+  paths:
+    raw:     data/raw/dem
+    curated: data/curated/dem
+  filename: "algeria_dem.tif"
+  output_resolution_m: 1000   # resample to 1km to match grid
+
+worldpop:
+  paths:
+    raw:     data/raw/worldpop
+    curated: data/curated/worldpop
+  filename: "dza_pd_2020_1km_UNadj.tif"
+
+osm:
+  paths:
+    raw:     data/raw/roads
+    curated: data/curated/roads
+  filename: "algeria-260706.osm.pbf"
+
+era5:
+  paths:
+    raw:     data/raw/era5
+    curated: data/curated/era5
+  variables:
+    - "2m_temperature"
+    - "2m_dewpoint_temperature"
+    - "10m_u_component_of_wind"
+    - "10m_v_component_of_wind"
+    - "total_precipitation"
+    - "volumetric_soil_water_layer_1"
+  pressure_levels: null    # surface only
+
+sentinel:
+  paths:
+    raw:     data/raw/sentinel
+    curated: data/curated/sentinel
+  collection: "COPERNICUS/S2_SR_HARMONIZED"
+  max_cloud_pct: 20
+  indices:
+    - "NDVI"
+    - "NDWI"
+    - "NBR"
+
+firms:
+  paths:
+    raw:     data/raw/firms
+    curated: data/curated/firms
+  bbox:     "-8.67,18.96,11.99,37.09"
+  sensors:
+    - "VIIRS_SNPP_SP"
+    - "MODIS_SP"
+  map_key:  null    # set via environment variable FIRMS_MAP_KEY
+
+logging:
+  level:    "INFO"
+  file:     "logs/pipeline.log"
