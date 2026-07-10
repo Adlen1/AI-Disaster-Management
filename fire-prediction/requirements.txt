@@ -9,3 +9,5 @@ tqdm
 loguru
 pyyaml
 scipy
+pyarrow
+dotenv
