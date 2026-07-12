@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from loguru import logger
 import yaml
+import pandas as pd
 
 
 class DataSource(ABC):
@@ -71,3 +72,20 @@ class DataSource(ABC):
 def load_config(config_path: str = "configs/config.yaml") -> dict:
     with open(config_path) as f:
         return yaml.safe_load(f)
+
+
+def filter_fire_season(df: pd.DataFrame, config: dict,
+                        date_col: str = "date") -> pd.DataFrame:
+    """
+    If fire_season_only is True in config, keep only fire season months.
+    """
+    if not config.get("training", {}).get("fire_season_only", False):
+        return df
+
+    months = config["training"]["fire_season_months"]
+    df[date_col] = pd.to_datetime(df[date_col])
+    before = len(df)
+    df = df[df[date_col].dt.month.isin(months)].copy()
+    print(f"Fire season filter: {before} → {len(df)} rows "
+          f"(kept months {months})")
+    return df

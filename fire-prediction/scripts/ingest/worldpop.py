@@ -75,18 +75,16 @@ class WorldPopSource(DataSource):
 
         # ── Reproject and align to 1km grid ──────────────────────────────────
         
-        new_transform, new_width, new_height, bounds = get_algeria_grid(boundary_path)
+        grid = get_algeria_grid(boundary_path, self.config["algeria"]["grid_resolution_m"])
 
-        pop_resampled = np.full(
-            (new_height, new_width), np.nan, dtype=np.float32
-        )
+        pop_resampled = grid.empty_array()
 
         reproject(
             source=clipped,
             destination=pop_resampled,
             src_transform=clip_transform,
             src_crs=src_crs,
-            dst_transform=new_transform,
+            dst_transform=grid.transform,
             dst_crs="EPSG:4326",
             resampling=Resampling.bilinear,
             src_nodata=np.nan,
@@ -98,12 +96,12 @@ class WorldPopSource(DataSource):
         with rasterio.open(out_path, "w", **{
             "driver":    "GTiff",
             "dtype":     "float32",
-            "crs":       "EPSG:4326",
-            "transform": new_transform,
-            "width":     new_width,
-            "height":    new_height,
+            "crs":       grid.crs,
+            "transform": grid.transform,
+            "width":     grid.width,
+            "height":    grid.height,
             "count":     1,
-            "nodata":    np.nan,
+            "nodata":    float("nan"),
             "compress":  "lzw",
         }) as dst:
             dst.write(pop_resampled, 1)
@@ -113,7 +111,7 @@ class WorldPopSource(DataSource):
             f"Shape: {pop_resampled.shape}, "
             f"valid: {np.sum(~np.isnan(pop_resampled))} pixels"
         )
-
+        
 
     def load(self):
         """Return curated population density array."""

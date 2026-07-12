@@ -42,7 +42,7 @@ class OSMSource(DataSource):
     def curate(self):
         """
         Extract roads from .pbf, compute distance raster.
-        Uses pyogrio to read from .pbf directly without osmium preprocessing.
+        Uses pyogrio to read from .pbf directly.
         """
         pbf_path      = self.raw_dir / self.config["osm"]["filename"]
         out_dir       = Path(self.config["osm"]["paths"]["curated"])
@@ -96,24 +96,19 @@ class OSMSource(DataSource):
         # ── Compute distance-to-road raster ──────────────────────────────────
         self.logger.info("Computing distance-to-road raster")
 
-        # Use same 1km grid as DEM and WorldPop
-        transform, width, height, bounds = get_algeria_grid(boundary_path)
+        grid = get_algeria_grid(boundary_path, self.config["algeria"]["grid_resolution_m"])
 
-        # Rasterize roads → binary mask (1=road, 0=no road)
         road_mask = rasterize(
             [(geom, 1) for geom in roads.geometry if geom is not None],
-            out_shape=(height, width),
-            transform=transform,
+            out_shape=grid.shape(),
+            transform=grid.transform,
             fill=0,
             dtype=np.uint8,
         )
 
-        # Distance transform — pixels away from nearest road
-        # distance_transform_edt returns distance in pixels
-        # multiply by pixel size in km to get km distance
-        no_road_mask   = (road_mask == 0)
-        dist_pixels    = distance_transform_edt(no_road_mask)
-        dist_km        = dist_pixels * (1000 / 1000)  # 1km pixels → km
+        no_road_mask = (road_mask == 0)
+        dist_pixels = distance_transform_edt(no_road_mask)
+        dist_km = dist_pixels * (grid.res_m / 1000.0)
 
         self.logger.info(
             f"Distance range: {dist_km.min():.1f} → {dist_km.max():.1f} km"
@@ -124,15 +119,15 @@ class OSMSource(DataSource):
         with rasterio.open(dist_path, "w", **{
             "driver":    "GTiff",
             "dtype":     "float32",
-            "crs":       "EPSG:4326",
-            "transform": transform,
-            "width":     width,
-            "height":    height,
+            "crs":       grid.crs,
+            "transform": grid.transform,
+            "width":     grid.width,
+            "height":    grid.height,
             "count":     1,
-            "nodata":    np.nan,
+            "nodata":    float("nan"),
             "compress":  "lzw",
         }) as dst:
-            dst.write(dist_km.astype(np.float32), 1)
+            dst.write(dist_km, 1)
 
         self.logger.info(f"Saved distance raster → {dist_path}")
 

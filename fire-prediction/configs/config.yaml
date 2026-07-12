@@ -9,7 +9,7 @@ paths:
 algeria:
   bbox:         [-8.67, 18.96, 11.99, 37.09]   # [west, south, east, north]
   crs:          "EPSG:4326"
-  grid_resolution_km: 5                          # spatial grid cell size
+  grid_resolution_m: 1000                          # spatial grid cell size
 
 gadm:
   paths:
@@ -25,7 +25,6 @@ dem:
     raw:     data/raw/dem
     curated: data/curated/dem
   filename: "algeria_dem.tif"
-  output_resolution_m: 1000   # resample to 1km to match grid
 
 worldpop:
   paths:
@@ -53,26 +52,33 @@ era5:
   pressure_levels: null    # surface only
 
 sentinel:
+  gee_project: "ai-disaster-management-502014"
   paths:
-    raw:     data/raw/sentinel
-    curated: data/curated/sentinel
-  collection: "COPERNICUS/S2_SR_HARMONIZED"
-  max_cloud_pct: 20
-  indices:
-    - "NDVI"
-    - "NDWI"
-    - "NBR"
+    raw: "data/raw/sentinel"
+    curated: "data/curated/sentinel"
 
 firms:
   paths:
     raw:     data/raw/firms
     curated: data/curated/firms
-  bbox:     "-8.67,18.96,11.99,37.09"
   sensors:
-    - "VIIRS_SNPP_SP"
-    - "MODIS_SP"
+    - MODIS_SP
+    - VIIRS_SNPP_SP
+    - VIIRS_NOAA20_SP
+    - VIIRS_NOAA21_SP
   map_key:  null    # set via environment variable FIRMS_MAP_KEY
 
 logging:
   level:    "INFO"
   file:     "logs/pipeline.log"
+
+
+# ── Training window ────────────────────────────────────────────────────────
+# Sentinel-2 defines the earliest date (June 2015).
+# Fire season: May-October for Algeria.
+# All dynamic sources use these same bounds.
+training:
+  start_date:       "2015-06-01"
+  end_date:         "2025-10-31"
+  fire_season_only: true
+  fire_season_months: [5, 6, 7, 8, 9, 10]   # May → October

@@ -17,6 +17,8 @@ import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from utils.base import DataSource
 from dotenv import load_dotenv
+from utils.base import filter_fire_season
+import geopandas as gpd
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
@@ -32,7 +34,7 @@ FIRMS_KEEP_COLS = [
 class FIRMSSource(DataSource):
 
     BASE_URL      = "https://firms.modaps.eosdis.nasa.gov/api/area/csv"
-    MAX_DAYS_ARCH = 374   # max days per API call for archive sensors (_SP)
+    MAX_DAYS_ARCH = 5   # max days per API call for archive sensors (_SP)
 
     # ── INGESTION ─────────────────────────────────────────────────────────────
 
@@ -40,9 +42,6 @@ class FIRMSSource(DataSource):
         """
         Download FIRMS data for Algeria via API.
         Skip this if data already in raw/firms/ as CSV.
-
-        Training mode:    ingest("2012-01-01", "2025-12-31")
-        Operational mode: ingest("2026-07-09", "2026-07-09")
         """
         map_key = os.getenv("FIRMS_MAP_KEY")
         if not map_key:
@@ -51,7 +50,9 @@ class FIRMSSource(DataSource):
                 "Get yours at: https://firms.modaps.eosdis.nasa.gov/api/map_key/"
             )
 
-        bbox    = self.config["firms"]["bbox"]
+        bbox_list = self.config["algeria"]["bbox"]
+        bbox = ",".join(str(x) for x in bbox_list)
+        
         sensors = self.config["firms"]["sensors"]
 
         if not start_date:
@@ -68,12 +69,38 @@ class FIRMSSource(DataSource):
             f"({total_days} days, {len(sensors)} sensors)"
         )
 
+        # Skip if raw files already exist
+        existing = list(self.raw_dir.glob("*.csv"))
+        if existing:
+            self.logger.info(
+                f"Found {len(existing)} existing CSV(s) in data/raw/firms/ — "
+                f"skipping API ingestion. Delete raw files to force re-download."
+            )
+            return
+
+        # Fire season filter for API ingestion
+        fire_months = self.config.get("training", {}).get(
+            "fire_season_months", list(range(1, 13))
+        )
+
         for sensor in sensors:
             all_dfs     = []
             chunk_start = start
 
             with tqdm(total=total_days, desc=f"{sensor}", unit="days") as pbar:
                 while chunk_start <= end:
+
+                    # Jump entire non-fire-season months
+                    if chunk_start.month not in fire_months:
+                        if chunk_start.month == 12:
+                            next_month = chunk_start.replace(year=chunk_start.year + 1, month=1, day=1)
+                        else:
+                            next_month = chunk_start.replace(month=chunk_start.month + 1, day=1)
+                        skipped = (next_month - chunk_start).days
+                        pbar.update(skipped)
+                        chunk_start = next_month
+                        continue
+
                     chunk_end = min(
                         chunk_start + timedelta(days=self.MAX_DAYS_ARCH - 1),
                         end
@@ -164,7 +191,7 @@ class FIRMSSource(DataSource):
         # ── Vegetation fires only ─────────────────────────────────────────────
         if "type" in df.columns:
             n  = len(df)
-            df = df[df["type"] == 0]
+            df = df[df["type"].isna() | (df["type"] == 0)]
             self.logger.info(f"Type filter: {n} → {len(df)} (dropped {n - len(df)})")
 
         # ── Deduplicate ───────────────────────────────────────────────────────
@@ -192,6 +219,26 @@ class FIRMSSource(DataSource):
             f"Fire season Jul-Sep: {fire_season_pct:.1f}% "
             f"({'Good' if fire_season_pct > 50 else 'check'})"
         )
+
+        # Drop metadata columns not needed for training
+        df = df.drop(columns=["version"], errors="ignore")
+
+        df = filter_fire_season(df, self.config, date_col="acq_date")
+
+        boundary_path = Path(self.config["gadm"]["paths"]["curated"]) / "algeria_wilayas.gpkg"
+        
+        
+        wilayas = (
+            gpd.read_file(boundary_path)[["GID_1", "NAME_1", "geometry"]]
+            .rename(columns={
+                "GID_1": "wilaya_id",
+                "NAME_1": "wilaya_name"
+            })
+        )
+
+        gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.longitude, df.latitude), crs="EPSG:4326")
+        gdf = gpd.sjoin(gdf, wilayas, how="left", predicate="within").drop(columns=["geometry", "index_right"])
+        df  = pd.DataFrame(gdf.drop(columns="geometry", errors="ignore"))
 
         # ── Save as parquet ───────────────────────────────────────────────────
         start_str = df["acq_date"].min().strftime("%Y%m%d")
@@ -223,7 +270,7 @@ if __name__ == "__main__":
 
     config["paths"] = config["firms"]["paths"]
     source = FIRMSSource(config)
-    # source.ingest("2021-08-10", "2021-08-10")
+    source.ingest( "2015-06-01", "2025-10-31")
 
     source.curate()
 
@@ -232,3 +279,4 @@ if __name__ == "__main__":
     print(f"   Shape: {df.shape}")
     print(f"   Date range: {df['acq_date'].min()} → {df['acq_date'].max()}")
     print(f"   Columns: {list(df.columns)}")
+    print(df)

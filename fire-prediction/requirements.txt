@@ -11,3 +11,10 @@ pyyaml
 scipy
 pyarrow
 dotenv
+xarray
+cdsapi
+netCDF4
+earthengine-api
+geemap
+# shapely
+# python-dateutil
