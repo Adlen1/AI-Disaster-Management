@@ -247,13 +247,26 @@ def compute_fwi_series(df: pd.DataFrame) -> pd.DataFrame:
     n_cells = len(cell_ids)
     cell_idx = {cid: i for i, cid in enumerate(cell_ids)}
 
-    prev_ffmc = np.full(n_cells, 85.0)
-    prev_dmc = np.full(n_cells, 6.0)
-    prev_dc = np.full(n_cells, 15.0)
+    # Standard initial values (Van Wagner, 1987)
+    FFMC0 = 85.0
+    DMC0 = 6.0
+    DC0 = 15.0
+
+    prev_ffmc = np.full(n_cells, FFMC0)
+    prev_dmc = np.full(n_cells, DMC0)
+    prev_dc = np.full(n_cells, DC0)
 
     fwi_rows = []
 
     for date in dates:
+        current_date = pd.Timestamp(date)
+
+        # Reset the FWI state at the start of each fire season
+        if current_date.month == 5 and current_date.day == 1:
+            prev_ffmc.fill(FFMC0)
+            prev_dmc.fill(DMC0)
+            prev_dc.fill(DC0)
+
         day = df[df["date"] == date].copy().set_index("era5_cell_id")
 
         ffmc_out = np.full(n_cells, np.nan)

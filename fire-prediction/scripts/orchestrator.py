@@ -112,10 +112,13 @@ def run_pipeline(mode: str, force_static: bool = False):
         # Sentinel-2 revisit + processing ~5 days
         # FIRMS NRT available within ~3 hours
         today = datetime.today()
-        firms_start    = today.strftime("%Y-%m-%d")        # NRT — today
-        era5_start     = (today - timedelta(days=7)).strftime("%Y-%m-%d")   # ERA5T lag
-        sentinel_start = (today - timedelta(days=10)).replace(day=1).strftime("%Y-%m-%d")
-        firms_end = era5_start_end = sentinel_start_end = today.strftime("%Y-%m-%d")
+        firms_start = firms_end = today.strftime("%Y-%m-%d")
+
+        era5_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+        era5_start = era5_end = era5_date
+
+        sentinel_start = today.replace(day=1).strftime("%Y-%m-%d")
+        sentinel_end = today.strftime("%Y-%m-%d")
 
     print(f"\n{'='*55}")
     print(f"  Pipeline — mode: {mode.upper()}")
