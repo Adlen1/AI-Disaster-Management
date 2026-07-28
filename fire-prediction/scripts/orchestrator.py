@@ -129,8 +129,11 @@ def run_pipeline(mode: str, force_static: bool = False):
             print(f"  Fire season only: {months}")
     else:
         print(f"  FIRMS:    {firms_start} (NRT)")
-        print(f"  ERA5:     {era5_start} → {era5_start_end} (ERA5T)")
-        print(f"  Sentinel: {sentinel_start} → {sentinel_start_end}")
+        
+        print(f"  ERA5:     {era5_start} → {era5_end} (ERA5T)")
+        
+        print(f"  Sentinel: {sentinel_start} → {sentinel_end}")
+    
     print(f"{'='*55}\n")
 
     preflight_check(config, mode)
@@ -200,13 +203,13 @@ def run_pipeline(mode: str, force_static: bool = False):
             "ERA5 (ERA5T)",
             ERA5Source(build_cfg(config, "era5")),
             start_date=era5_start,
-            end_date=era5_start_end
+            end_date=era5_end
         )
         results["sentinel"] = run_source(
             "Sentinel-2",
             SentinelSource(build_cfg(config, "sentinel")),
             start_date=sentinel_start,
-            end_date=sentinel_start_end
+            end_date=sentinel_end
         )
 
     # ── Summary ───────────────────────────────────────────────────────────────
@@ -223,10 +226,6 @@ def run_pipeline(mode: str, force_static: bool = False):
         print(f"  Fix errors above and re-run — existing curated files are preserved.")
     else:
         print(f"\n  All sources complete.")
-        if mode == "train":
-            print(f"  Next: python scripts/integrate/build_dataset.py")
-        else:
-            print(f"  Next: python scripts/predict/run_prediction.py")
     print()
 
 

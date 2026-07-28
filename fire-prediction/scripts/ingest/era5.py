@@ -10,13 +10,13 @@ Key architectural decision:
 
 Output:
   raw/era5/era5_YYYYMM.nc           <- one NetCDF per month
+  
   curated/era5/era5_YYYYMMDD_YYYYMMDD.parquet
   -> columns: date, era5_cell_id, lat, lon,
               temp_c, rh, wind_speed_kmh, wind_dir,
               precip_mm, soil_moisture,
               FFMC, DMC, DC, ISI, BUI, FWI
 """
-
 import shutil
 import sys
 import zipfile
@@ -36,10 +36,9 @@ from utils.base import DataSource
 from utils.base import filter_fire_season
 
 
-
-# ── FWI COMPUTATION ───────────────────────────────────────────────────────────
+# ── FWI VECTORIZED COMPUTATION (Algeria Adjusted) ─────────────────────────────
 # Canadian Fire Weather Index — Van Wagner (1987)
-# All formulas verified against the original paper.
+# Optimized with full vector calculations across spatial grid cell indices.
 
 def compute_relative_humidity(temp_k: np.ndarray, dewpoint_k: np.ndarray) -> np.ndarray:
     """Derive RH (%) from temperature and dewpoint (Kelvin)."""
@@ -49,7 +48,7 @@ def compute_relative_humidity(temp_k: np.ndarray, dewpoint_k: np.ndarray) -> np.
         np.exp((17.625 * dew_c)  / (243.04 + dew_c)) /
         np.exp((17.625 * temp_c) / (243.04 + temp_c))
     )
-    return np.clip(rh, 0, 100)
+    return np.clip(rh, 0.0, 100.0)
 
 
 def compute_wind_speed_kmh(u: np.ndarray, v: np.ndarray) -> np.ndarray:
@@ -62,251 +61,309 @@ def compute_wind_direction(u: np.ndarray, v: np.ndarray) -> np.ndarray:
     return (270 - np.degrees(np.arctan2(v, u))) % 360
 
 
-def _ffmc_scalar(temp, rh, wind_kmh, rain, prev_ffmc):
-    """
-    Fine Fuel Moisture Code — Van Wagner (1987).
-    Verified against authoritative pyfwi / FWI_CMIP6 implementations.
-    """
-    # Clamp inputs
-    rh       = max(0.0, min(100.0, rh))
-    wind_kmh = max(0.0, wind_kmh)
-    rain     = max(0.0, rain)
+def _ffmc_vectorized(temp: np.ndarray, rh: np.ndarray, wind_kmh: np.ndarray, rain: np.ndarray, prev_ffmc: np.ndarray) -> np.ndarray:
+    """Vectorized Fine Fuel Moisture Code across all active cells."""
+    rh       = np.clip(rh, 0.0, 100.0)
+    wind_kmh = np.maximum(0.0, wind_kmh)
+    rain     = np.maximum(0.0, rain)
 
     mo = 147.2 * (101.0 - prev_ffmc) / (59.5 + prev_ffmc)
 
-    if rain > 0.5:
-        rf = rain - 0.5
-        mr = mo + 42.5 * rf * np.exp(-100.0 / (251.0 - mo)) * (1.0 - np.exp(-6.93 / rf))
-        if mo > 150:
-            mr += 0.0015 * (mo - 150.0)**2 * rf**0.5
-        mo = min(mr, 250.0)
+    # Wetting Phase (precipitation > 0.5 mm)
+    rain_mask = rain > 0.5
+    rf = rain - 0.5
+    mr = mo.copy()
+    
+    if np.any(rain_mask):
+        mo_m = mo[rain_mask]
+        rf_m = rf[rain_mask]
+        mr_val = mo_m + 42.5 * rf_m * np.exp(-100.0 / (251.0 - mo_m)) * (1.0 - np.exp(-6.93 / rf_m))
+        
+        high_moist = mo_m > 150.0
+        mr_val = np.where(high_moist, mr_val + 0.0015 * ((mo_m - 150.0)**2) * np.sqrt(rf_m), mr_val)
+        mr[rain_mask] = np.minimum(mr_val, 250.0)
 
-    ed = (0.942 * rh**0.679
+    # Equilibrium Moisture Content (EMC) Calculations
+    ed = (0.942 * (rh**0.679)
           + 11.0 * np.exp((rh - 100.0) / 10.0)
           + 0.18 * (21.1 - temp) * (1.0 - np.exp(-0.115 * rh)))
 
-    ew = (0.618 * rh**0.753
+    ew = (0.618 * (rh**0.753)
           + 10.0 * np.exp((rh - 100.0) / 10.0)
           + 0.18 * (21.1 - temp) * (1.0 - np.exp(-0.115 * rh)))
 
-    if mo > ed:
-        ko = (0.424 * (1.0 - (rh / 100.0)**1.7)
-              + 0.0694 * wind_kmh**0.5 * (1.0 - (rh / 100.0)**8))
-        kd = ko * 0.581 * np.exp(0.0365 * temp)
-        mo = ed + (mo - ed) * 10.0**(-kd)
-    elif mo < ew:
-        kl = (0.424 * (1.0 - ((100.0 - rh) / 100.0)**1.7)
-              + 0.0694 * wind_kmh**0.5 * (1.0 - ((100.0 - rh) / 100.0)**8))
-        kw = kl * 0.581 * np.exp(0.0365 * temp)
-        mo = ew - (ew - mo) * 10.0**(-kw)
+    # Drying Phase (moisture > ed)
+    ko = (0.424 * (1.0 - (rh / 100.0)**1.7)
+          + 0.0694 * np.sqrt(wind_kmh) * (1.0 - (rh / 100.0)**8))
+    kd = ko * 0.581 * np.exp(0.0365 * temp)
+    m_dry = ed + (mr - ed) * (10.0**(-kd))
 
-    return 59.5 * (250.0 - mo) / (147.2 + mo)
+    # Wetting Phase (moisture < ew)
+    kl = (0.424 * (1.0 - ((100.0 - rh) / 100.0)**1.7)
+          + 0.0694 * np.sqrt(wind_kmh) * (1.0 - ((100.0 - rh) / 100.0)**8))
+    kw = kl * 0.581 * np.exp(0.0365 * temp)
+    m_wet = ew - (ew - mr) * (10.0**(-kw))
+
+    # Select appropriate drying/wetting values, keeping current if within the hysteresis envelope
+    mo_final = np.where(mr > ed, m_dry, np.where(mr < ew, m_wet, mr))
+    ffmc = 59.5 * (250.0 - mo_final) / (147.2 + mo_final)
+    return np.clip(ffmc, 0.0, 101.0)
 
 
-def _dmc_scalar(temp, rh, rain, month, prev_dmc):
-    """
-    Duff Moisture Code — Van Wagner (1987).
-    Day-length factors for Northern Algeria (~28-37°N), using 'bins' method.
-    """
-    rh   = max(0.0, min(100.0, rh))
-    rain = max(0.0, rain)
+def _dmc_vectorized(temp: np.ndarray, rh: np.ndarray, rain: np.ndarray, month: int, prev_dmc: np.ndarray) -> np.ndarray:
+    """Vectorized Duff Moisture Code incorporating Mediterranean Day-Lengths."""
+    rh   = np.clip(rh, 0.0, 100.0)
+    rain = np.maximum(0.0, rain)
 
-    if rain > 1.5:
-        re = 0.92 * rain - 1.27
-        mo = 20.0 + np.exp(5.6348 - prev_dmc / 43.43)
-        if prev_dmc <= 33:
-            b = 100.0 / (0.5 + 0.3 * prev_dmc)
-        elif prev_dmc <= 65:
-            b = 14.0 - 1.3 * np.log(prev_dmc)
-        else:
-            b = 6.2 * np.log(prev_dmc) - 17.2
+    # Wetting Phase (precipitation > 1.5 mm)
+    rain_mask = rain > 1.5
+    p_dmc = prev_dmc.copy()
+
+    if np.any(rain_mask):
+        re = 0.92 * rain[rain_mask] - 1.27
+        mo = 20.0 + np.exp(5.6348 - prev_dmc[rain_mask] / 43.43)
+        p_dmc_m = prev_dmc[rain_mask]
+        
+        # Piecewise calculation of b
+        b = np.where(p_dmc_m <= 33.0, 
+                     100.0 / (0.5 + 0.3 * p_dmc_m),
+                     np.where(p_dmc_m <= 65.0, 
+                              14.0 - 1.3 * np.log(p_dmc_m), 
+                              6.2 * np.log(p_dmc_m) - 17.2))
+                              
         mr = mo + 1000.0 * re / (48.77 + b * re)
-        pr = 244.72 - 43.43 * np.log(mr - 20.0)
-        prev_dmc = max(pr, 0.0)
+        pr = 244.72 - 43.43 * np.log(np.maximum(mr - 20.0, 1e-5))
+        p_dmc[rain_mask] = np.maximum(pr, 0.0)
 
-    if temp <= -1.1:
-        return prev_dmc
+    # Drying Phase 
+    algeria_dmc_le = [6.5, 7.5, 9.0, 12.8,13.9, 13.9, 12.4, 10.9,9.4, 8.0, 7.0, 6.0]
+    
+    month = np.clip(month, 1, 12)
+    Le = algeria_dmc_le[month - 1]
 
-    # Day-length factor for Algeria latitudes (20-33°N range → DayLength20N)
-    # Algeria fire-prone north: 33-37°N → DayLength46N
-    # Using the standard Canadian values (original method, appropriate for Algeria)
-    Le = [6.5, 7.5, 9.0, 12.8, 13.9, 13.9, 12.4, 10.9, 9.4, 8.0, 7.0, 6.0][month - 1]
-    k  = 1.894 * (temp + 1.1) * (100.0 - rh) * Le * 1e-6
-    return prev_dmc + 100.0 * k
+    temp = np.maximum(temp, -1.1)
 
+    k = (
+        1.894
+        * (temp + 1.1)
+        * (100.0 - rh)
+        * Le
+        * 1e-6
+    )
 
-def _dc_scalar(temp, rain, month, prev_dc):
-    """
-    Drought Code — Van Wagner (1987).
-    Drying factors for Northern Algeria (North of equator, original values).
-    """
-    rain = max(0.0, rain)
-
-    if rain > 2.8:
-        rd     = 0.83 * rain - 1.27
-        qo     = 800.0 * np.exp(-prev_dc / 400.0)
-        qr     = qo + 3.937 * rd
-        dr     = 400.0 * np.log(800.0 / qr)
-        prev_dc = max(dr, 0.0)
-
-    # Drying factors — original Van Wagner values (Northern hemisphere)
-    Lf = [-1.6, -1.6, -1.6, 0.9, 3.8, 5.8, 6.4, 5.0, 2.4, 0.4, -1.6, -1.6][month - 1]
-
-    if temp <= -2.8:
-        v = Lf
-    else:
-        v = 0.36 * (temp + 2.8) + Lf
-
-    v = max(v, 0.0)
-    return prev_dc + 0.5 * v
+    dmc_new = p_dmc + 100.0 * k
+    return np.maximum(dmc_new, 0.0)
 
 
-def _isi_scalar(wind_kmh, ffmc_val):
-    """
-    Initial Spread Index — Van Wagner (1987).
-    Verified: coefficient is 91.9 (not 19.115), divisor is 49,300,000.
-    Edge case: if FFMC > 101, set fm = 0 (approximation artifact in FFMC formula).
-    """
-    wind_kmh = max(0.0, wind_kmh)
+def _dc_vectorized(temp: np.ndarray, rain: np.ndarray, month: int, prev_dc: np.ndarray) -> np.ndarray:
+    """Vectorized Drought Code incorporating Mediterranean Drying Factors."""
+    rain = np.maximum(0.0, rain)
 
+    # Wetting Phase (precipitation > 2.8 mm)
+    rain_mask = rain > 2.8
+    p_dc = prev_dc.copy()
+
+    if np.any(rain_mask):
+        rd = 0.83 * rain[rain_mask] - 1.27
+        qo = 800.0 * np.exp(-prev_dc[rain_mask] / 400.0)
+        qr = qo + 3.937 * rd
+        dr = 400.0 * np.log(800.0 / np.maximum(qr, 1e-5))
+        p_dc[rain_mask] = np.maximum(dr, 0.0)
+
+    # Drying Phase (Algerian latitudes: 30°N to 40°N standard)
+    algeria_dc_lf = [-1.6,-1.6,-1.6,0.9,3.8,5.8,6.4,5.0,2.4,0.4,-1.6,-1.6]
+    Lf = algeria_dc_lf[month - 1]
+
+    v = np.where(temp <= -2.8, Lf, 0.36 * (temp + 2.8) + Lf)
+    v = np.maximum(v, 0.0)
+    
+    return np.maximum(p_dc + 0.5 * v, 0.0)
+
+
+def _isi_vectorized(wind_kmh: np.ndarray, ffmc_val: np.ndarray) -> np.ndarray:
+    """Vectorized Initial Spread Index."""
+    wind_kmh = np.maximum(0.0, wind_kmh)
     m = 147.2 * (101.0 - ffmc_val) / (59.5 + ffmc_val)
-    m = max(m, 0.0)  # handles FFMC > 101 edge case
+    m = np.maximum(m, 0.0)
 
     f_wind = np.exp(0.05039 * wind_kmh)
-    f_fuel = 91.9 * np.exp(-0.1386 * m) * (1.0 + m**5.31 / 49300000.0)
+    f_fuel = 91.9 * np.exp(-0.1386 * m) * (1.0 + (m**5.31) / 49300000.0)
     return 0.208 * f_wind * f_fuel
 
 
-def _bui_scalar(dmc_val, dc_val):
-    """
-    Buildup Index — Van Wagner (1987).
-    Handles DMC=DC=0 edge case explicitly.
-    """
-    dmc_val = max(dmc_val, 0.0)
-    dc_val  = max(dc_val,  0.0)
+def _bui_vectorized(dmc_val: np.ndarray, dc_val: np.ndarray) -> np.ndarray:
+    """Vectorized Buildup Index explicitly resolving edge cases."""
+    dmc_val = np.maximum(dmc_val, 0.0)
+    dc_val  = np.maximum(dc_val, 0.0)
 
-    if dmc_val == 0.0 and dc_val == 0.0:
-        return 0.0
+    denom = dmc_val + 0.4 * dc_val
+    
+    bui_under = np.where(denom > 0.0, 0.8 * dmc_val * dc_val / denom, 0.0)
+    bui_over = dmc_val - (1.0 - 0.8 * dc_val / denom) * (0.92 + (0.0114 * dmc_val) ** 1.7)
 
-    if dmc_val <= 0.4 * dc_val:
-        denom = dmc_val + 0.4 * dc_val
-        bui   = 0.8 * dmc_val * dc_val / denom if denom > 0 else 0.0
-    else:
-        bui = dmc_val - (1.0 - 0.8 * dc_val / (dmc_val + 0.4 * dc_val)) * \
-              (0.92 + (0.0114 * dmc_val)**1.7)
-
-    return max(bui, 0.0)
+    bui = np.where(dmc_val <= 0.4 * dc_val, bui_under, bui_over)
+    bui = np.where((dmc_val == 0.0) & (dc_val == 0.0), 0.0, bui)
+    return np.maximum(bui, 0.0)
 
 
-def _fwi_scalar(isi_val, bui_val):
-    """
-    Fire Weather Index — Van Wagner (1987).
-    """
-    isi_val = max(isi_val, 0.0)
-    bui_val = max(bui_val, 0.0)
+def _fwi_vectorized(isi_val: np.ndarray, bui_val: np.ndarray) -> np.ndarray:
+    """Vectorized Fire Weather Index without fractional power warnings."""
+    isi_val = np.maximum(isi_val, 0.0)
+    bui_val = np.maximum(bui_val, 0.0)
 
-    if bui_val <= 80.0:
-        fd = 0.626 * bui_val**0.809 + 2.0
-    else:
-        fd = 1000.0 / (25.0 + 108.64 * np.exp(-0.023 * bui_val))
+    fd = np.where(bui_val <= 80.0,
+                  0.626 * (bui_val**0.809) + 2.0,
+                  1000.0 / (25.0 + 108.64 * np.exp(-0.023 * bui_val)))
 
     b = 0.1 * isi_val * fd
+    
+    # 1. To prevent log(0) issues, floor b at a small epsilon
+    b_safe = np.maximum(b, 1e-5)
+    
+    # 2. To prevent raising negative numbers to the 0.647 fractional power,
+    # we clamp the logarithmic term at a minimum of 0.0. 
+    # (Since 0.434 * log(B) is only > 0 when B > 1.0, this is mathematically identical)
+    log_term = np.maximum(0.434 * np.log(b_safe), 0.0)
+    fwi_over_1 = np.exp(2.72 * (log_term**0.647))
 
-    if b <= 0.0:
-        return 0.0
-    elif b > 1.0:
-        return np.exp(2.72 * (0.434 * np.log(b))**0.647)
-    else:
-        return b
+    return np.where(b <= 0.0, 0.0, np.where(b > 1.0, fwi_over_1, b))
+
+
+DEFAULT_FFMC = 85.0
+DEFAULT_DMC = 6.0
+DEFAULT_DC = 15.0
+RESET_GAP_DAYS = 35
 
 
 def compute_fwi_series(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute FWI components for all ERA5 cells over time.
-    Loops over TIME (unavoidable - day-to-day carry-over state).
-    Loops over cells within each day (scalar formulas) - fine at this scale
-    (~120 cells x ~thousands of days), not true numpy vectorization.
+    Compute FWI components vectorized across all ERA5 grid cells.
 
-    Input:  df with columns [date, era5_cell_id, temp_c, rh,
-                              wind_speed_kmh, precip_mm, month]
-    Output: df with added columns [FFMC, DMC, DC, ISI, BUI, FWI]
+    Notes
+    -----
+    - Vectorized across all ERA5 cells for each day.
+    - Loops only over dates because FFMC/DMC/DC are recursive.
+    - Automatically resets moisture codes after a long gap
+      (e.g. October -> May when only fire-season months are processed).
     """
-    df = df.copy().sort_values(["date", "era5_cell_id"])
 
-    # Guard against duplicate (date, cell) rows - would silently break .loc[cid] below
-    dupes = df.duplicated(["date", "era5_cell_id"]).sum()
-    if dupes > 0:
+    df = df.sort_values(["date", "era5_cell_id"]).copy()
+
+    if df.duplicated(["date", "era5_cell_id"]).any():
         raise ValueError(
-            f"Found {dupes} duplicate (date, era5_cell_id) rows before FWI computation. "
-            f"Fix the upstream curation step - FWI carry-over state assumes exactly "
-            f"one row per cell per day."
+            "Duplicate (date, era5_cell_id) rows found before FWI computation."
         )
 
-    dates = sorted(df["date"].unique())
-    cell_ids = sorted(df["era5_cell_id"].unique())
+    cell_ids = np.sort(df["era5_cell_id"].unique())
     n_cells = len(cell_ids)
-    cell_idx = {cid: i for i, cid in enumerate(cell_ids)}
 
-    # Standard initial values (Van Wagner, 1987)
-    FFMC0 = 85.0
-    DMC0 = 6.0
-    DC0 = 15.0
+    cell_idx = pd.Series(
+        np.arange(n_cells, dtype=np.int32),
+        index=cell_ids,
+    )
 
-    prev_ffmc = np.full(n_cells, FFMC0)
-    prev_dmc = np.full(n_cells, DMC0)
-    prev_dc = np.full(n_cells, DC0)
+    prev_ffmc = np.full(n_cells, DEFAULT_FFMC, dtype=np.float64)
+    prev_dmc = np.full(n_cells, DEFAULT_DMC, dtype=np.float64)
+    prev_dc = np.full(n_cells, DEFAULT_DC, dtype=np.float64)
 
-    fwi_rows = []
+    # Track when each ERA5 cell was last processed
+    last_seen = np.full(n_cells, np.datetime64("NaT"), dtype="datetime64[D]")
 
-    for date in dates:
-        current_date = pd.Timestamp(date)
+    results = []
+    resets_applied = 0
 
-        # Reset the FWI state at the start of each fire season
-        if current_date.month == 5 and current_date.day == 1:
-            prev_ffmc.fill(FFMC0)
-            prev_dmc.fill(DMC0)
-            prev_dc.fill(DC0)
+    for date, day_df in df.groupby("date", sort=True):
 
-        day = df[df["date"] == date].copy().set_index("era5_cell_id")
+        current_date = np.datetime64(pd.Timestamp(date).date())
 
-        ffmc_out = np.full(n_cells, np.nan)
-        dmc_out = np.full(n_cells, np.nan)
-        dc_out = np.full(n_cells, np.nan)
-        isi_out = np.full(n_cells, np.nan)
-        bui_out = np.full(n_cells, np.nan)
-        fwi_out = np.full(n_cells, np.nan)
+        day_df = day_df.copy()
 
-        month = int(pd.to_datetime(date).month)
+        idx = cell_idx.loc[day_df["era5_cell_id"]].to_numpy()
 
-        for cid in cell_ids:
-            i = cell_idx[cid]
-            if cid not in day.index:
-                continue  # missing data for this cell/day -> leave NaN, carry state unchanged
+        # ------------------------------------------------------------
+        # Reset cells whose previous observation is too far away
+        # (i.e. crossed the skipped off-season)
+        # ------------------------------------------------------------
+        seen = ~np.isnat(last_seen[idx])
 
-            row = day.loc[cid]
-            f = _ffmc_scalar(row.temp_c, row.rh, row.wind_speed_kmh, row.precip_mm, prev_ffmc[i])
-            d = _dmc_scalar(row.temp_c, row.rh, row.precip_mm, month, prev_dmc[i])
-            dcv = _dc_scalar(row.temp_c, row.precip_mm, month, prev_dc[i])
-            isiv = _isi_scalar(row.wind_speed_kmh, f)
-            buiv = _bui_scalar(d, dcv)
-            fwiv = _fwi_scalar(isiv, buiv)
+        if np.any(seen):
+            gap_days = (
+                current_date.astype("datetime64[D]")
+                - last_seen[idx][seen]
+            ).astype(int)
 
-            ffmc_out[i], dmc_out[i], dc_out[i] = f, d, dcv
-            isi_out[i], bui_out[i], fwi_out[i] = isiv, buiv, fwiv
+            reset_mask = np.zeros(len(idx), dtype=bool)
+            reset_mask[seen] = gap_days > RESET_GAP_DAYS
 
-            prev_ffmc[i], prev_dmc[i], prev_dc[i] = f, d, dcv
+            if np.any(reset_mask):
+                prev_ffmc[idx[reset_mask]] = DEFAULT_FFMC
+                prev_dmc[idx[reset_mask]] = DEFAULT_DMC
+                prev_dc[idx[reset_mask]] = DEFAULT_DC
+                resets_applied += reset_mask.sum()
 
-        day_result = day.reset_index().copy()
-        idx_lookup = day_result["era5_cell_id"].map(cell_idx)
-        day_result["FFMC"] = ffmc_out[idx_lookup]
-        day_result["DMC"] = dmc_out[idx_lookup]
-        day_result["DC"] = dc_out[idx_lookup]
-        day_result["ISI"] = isi_out[idx_lookup]
-        day_result["BUI"] = bui_out[idx_lookup]
-        day_result["FWI"] = fwi_out[idx_lookup]
-        fwi_rows.append(day_result)
+        temp = day_df["temp_c"].to_numpy()
+        rh = day_df["rh"].to_numpy()
+        wind = day_df["wind_speed_kmh"].to_numpy()
+        rain = day_df["precip_mm"].to_numpy()
+        month = pd.Timestamp(date).month
 
-    return pd.concat(fwi_rows, ignore_index=True)
+        ffmc = _ffmc_vectorized(
+            temp,
+            rh,
+            wind,
+            rain,
+            prev_ffmc[idx],
+        )
+
+        dmc = _dmc_vectorized(
+            temp,
+            rh,
+            rain,
+            month,
+            prev_dmc[idx],
+        )
+
+        dc = _dc_vectorized(
+            temp,
+            rain,
+            month,
+            prev_dc[idx],
+        )
+
+        isi = _isi_vectorized(
+            wind,
+            ffmc,
+        )
+
+        bui = _bui_vectorized(
+            dmc,
+            dc,
+        )
+
+        fwi = _fwi_vectorized(
+            isi,
+            bui,
+        )
+
+        # Persist state
+        prev_ffmc[idx] = ffmc
+        prev_dmc[idx] = dmc
+        prev_dc[idx] = dc
+
+        last_seen[idx] = current_date
+
+        day_df["FFMC"] = ffmc
+        day_df["DMC"] = dmc
+        day_df["DC"] = dc
+        day_df["ISI"] = isi
+        day_df["BUI"] = bui
+        day_df["FWI"] = fwi
+
+        results.append(day_df)
+
+    print(f"Season resets applied: {resets_applied}")
+
+    return pd.concat(results, ignore_index=True)
 
 
 # ── ERA5 SOURCE ───────────────────────────────────────────────────────────────
@@ -325,11 +382,6 @@ class ERA5Source(DataSource):
     def ingest(self, start_date: str = None, end_date: str = None):
         """
         Download ERA5 monthly NetCDF files for Algeria.
-        One file per month - skips already-downloaded months.
-
-        Precipitation note: ERA5 'total_precipitation' is an hourly
-        accumulation. We download all 24 hourly steps and sum them in
-        curate() to get the true 24h rainfall total for FWI computation.
         """
         if not start_date:
             start_date = datetime.today().strftime("%Y-%m-%d")
@@ -338,7 +390,7 @@ class ERA5Source(DataSource):
 
         start = datetime.strptime(start_date, "%Y-%m-%d")
         end = datetime.strptime(end_date, "%Y-%m-%d")
-        bbox = self.config["algeria"]["bbox"]  # [west, south, east, north]
+        bbox = self.config["algeria"]["bbox"]
 
         try:
             c = cdsapi.Client()
@@ -389,7 +441,7 @@ class ERA5Source(DataSource):
                         "day": days,
                         "time": all_hours,
                         "area": [bbox[3], bbox[0], bbox[1], bbox[2]],
-                        "data_format": "netcdf",       # new CDS-Beta key
+                        "data_format": "netcdf",
                         "download_format": "unarchived",
                     },
                     str(out_file)
@@ -403,8 +455,7 @@ class ERA5Source(DataSource):
             current += relativedelta(months=1)
 
     def _unwrap_if_zip(self, out_file: Path):
-        """CDS sometimes zips the response regardless of 'unarchived'. Unwrap
-        without depending on dask (xr.merge instead of open_mfdataset)."""
+        """Unwrap Zip archive if returned by Copernicus."""
         if not zipfile.is_zipfile(out_file):
             return
 
@@ -422,8 +473,7 @@ class ERA5Source(DataSource):
             if len(nc_inside) == 1:
                 shutil.move(str(nc_inside[0]), str(out_file))
             else:
-                self.logger.info(f"  Merging {len(nc_inside)} files (no dask needed): "
-                                  f"{[f.name for f in nc_inside]}")
+                self.logger.info(f"Merging {len(nc_inside)} files: {[f.name for f in nc_inside]}")
                 datasets = [self._standardize_era5_dataset(xr.open_dataset(f)) for f in nc_inside]
                 merged = xr.merge(datasets, compat="override", join="outer")
                 merged.to_netcdf(out_file)
@@ -435,16 +485,7 @@ class ERA5Source(DataSource):
 
     @staticmethod
     def _standardize_era5_dataset(ds: xr.Dataset) -> xr.Dataset:
-        """The new CDS backend has two quirks this normalizes:
-        1. It sometimes names the time coordinate 'valid_time' instead of
-           'time' — happens especially when instant/accum variable groups
-           get merged (each group can use a different name).
-        2. It sometimes adds an 'expver' dimension when a request spans the
-           boundary between final ERA5 and preliminary ERA5T data, giving
-           each timestep two versions (expver=1 final, expver=5 preliminary,
-           with NaNs filling whichever wasn't yet available). Collapse this
-           by taking whichever value is not NaN, preferring expver=1.
-        """
+        """Resolve ERA5 coordinate naming and expver version merges."""
         if "time" not in ds.coords and "valid_time" in ds.coords:
             ds = ds.rename({"valid_time": "time"})
 
@@ -459,41 +500,28 @@ class ERA5Source(DataSource):
         return ds
 
     def _open_era5_file(self, nc_file: Path) -> xr.Dataset:
-        """Open a single ERA5 monthly file, failing with a clear message if
-        it's still a zip (e.g. an interrupted ingest left it unfixed)."""
         if zipfile.is_zipfile(nc_file):
             raise RuntimeError(
-                f"{nc_file.name} is still a zip at curate() time — "
-                f"the ingest()-time unwrap didn't complete. "
-                f"Delete this file and re-run ingest() for this month."
+                f"{nc_file.name} is still a zip. Delete and re-run ingest()."
             )
         ds = xr.open_dataset(nc_file, engine="netcdf4")
         ds = self._standardize_era5_dataset(ds)
 
         if "time" not in ds.coords:
             raise RuntimeError(
-                f"{nc_file.name} has no 'time' or 'valid_time' coordinate after "
-                f"standardization. Available coords: {list(ds.coords)}. "
-                f"CDS may have changed its schema again — inspect the file directly."
+                f"{nc_file.name} has no valid time coordinates. Coords: {list(ds.coords)}."
             )
         return ds
 
     def curate(self):
-        """
-        Process ERA5 NetCDF files at native ~31km resolution.
-        One row per (date, era5_cell_id) — NOT per fine 1km cell.
-        Fine-grid join happens at integration time.
-
-        Precipitation: sums all 24 hourly steps -> true daily total.
-        Other variables: 11:00 UTC snapshot (~noon Algeria local time).
-        """
+        """Process monthly NetCDF files into native curated Parquet rows."""
         out_dir = Path(self.config["era5"]["paths"]["curated"])
         boundary_path = Path(self.config["gadm"]["paths"]["curated"]) / "algeria_country.gpkg"
         out_dir.mkdir(parents=True, exist_ok=True)
 
         nc_files = sorted(self.raw_dir.glob("era5_*.nc"))
         if not nc_files:
-            raise FileNotFoundError(f"No ERA5 .nc files in {self.raw_dir}\nRun ingest() first.")
+            raise FileNotFoundError(f"No ERA5 .nc files in {self.raw_dir}. Run ingest() first.")
 
         self.logger.info(f"Processing {len(nc_files)} ERA5 monthly files")
 
@@ -521,8 +549,7 @@ class ERA5Source(DataSource):
             cell_lats = flat_lats[in_algeria]
             cell_ids = np.where(in_algeria)[0]
 
-            self.logger.info(f"  ERA5 cells inside Algeria: {len(cell_ids)} "
-                              f"(from {len(flat_lons)} total)")
+            self.logger.info(f"  ERA5 cells inside Algeria: {len(cell_ids)} (from {len(flat_lons)} total)")
 
             times = pd.to_datetime(ds.time.values)
             dates = pd.DatetimeIndex(np.unique(times.date))
@@ -532,20 +559,20 @@ class ERA5Source(DataSource):
                 date_mask = times.date == date.date()
                 day_ds = ds.isel(time=date_mask)
 
-                # Precipitation: sum all hourly steps -> daily total (mm)
+                # Precipitation 24h accumulation
                 if "tp" in ds:
-                    precip_daily = day_ds["tp"].values.sum(axis=0) * 1000  # m -> mm
+                    precip_daily = day_ds["tp"].values.sum(axis=0) * 1000.0  # m -> mm
                     precip_flat = precip_daily.flatten()[in_algeria]
                 else:
                     precip_flat = np.zeros(len(cell_ids))
 
-                # Other variables: 11:00 UTC (noon Algeria local, UTC+1)
+                # Meteorological observation snapshot at noon (11:00 UTC / 12:00 Algeria local)
                 hour_mask = times.hour == 11
                 date_hour_mask = date_mask & hour_mask
                 if date_hour_mask.sum() == 0:
                     date_hour_mask = date_mask & (times.hour == 12)
                 if date_hour_mask.sum() == 0:
-                    self.logger.warning(f"  No noon data for {date_str} — skipping")
+                    self.logger.warning(f"  No solar-noon data for {date_str} — skipping")
                     continue
 
                 noon_ds = ds.isel(time=np.where(date_hour_mask)[0][0])
@@ -575,7 +602,7 @@ class ERA5Source(DataSource):
                     "rh": rh.round(2),
                     "wind_speed_kmh": wind_speed_kmh.round(2),
                     "wind_dir": wind_dir.round(1),
-                    "precip_mm": np.clip(precip_flat, 0, None).round(2),
+                    "precip_mm": np.clip(precip_flat, 0.0, None).round(2),
                     "soil_moisture": soil_moist.round(4),
                     "month": date.month,
                 })
@@ -587,10 +614,9 @@ class ERA5Source(DataSource):
         df = pd.concat(all_months, ignore_index=True)
         df["date"] = pd.to_datetime(df["date"])
 
-        self.logger.info(f"Combined: {df.shape} | cells: {df['era5_cell_id'].nunique()} | "
-                          f"dates: {df['date'].nunique()}")
+        self.logger.info(f"Combined: {df.shape} | cells: {df['era5_cell_id'].nunique()} | dates: {df['date'].nunique()}")
 
-        self.logger.info("Computing FWI components...")
+        self.logger.info("Computing FWI components (vectorized)...")
         df = compute_fwi_series(df)
 
         self.logger.info(f"Final shape: {df.shape}")
@@ -603,8 +629,7 @@ class ERA5Source(DataSource):
         
         off_season_avg = f"{off_season['FWI'].mean():.1f}" if len(off_season) > 0 else "n/a"
         self.logger.info(
-            f"Fire season avg FWI: {fire_season['FWI'].mean():.1f} "
-            f"(vs off-season: {off_season_avg})"
+            f"Fire season avg FWI: {fire_season['FWI'].mean():.1f} (vs off-season: {off_season_avg})"
         )
 
         df = filter_fire_season(df, self.config, date_col="date")

@@ -48,38 +48,53 @@ FIRMS_DIR      = CURATED / "firms"
 
 # ── RISK CLASS ASSIGNMENT ─────────────────────────────────────────────────────
 
+# def assign_risk_class(fire_count: pd.Series, frp_sum: pd.Series) -> pd.Series:
+#     """
+#     Convert raw FIRMS detection counts and FRP into a 5-class risk label.
+
+#     Classes:
+#       0 = NO_FIRE    — no detections
+#       1 = LOW        — 1-2 detections, low intensity
+#       2 = MODERATE   — small cluster or moderate intensity
+#       3 = HIGH       — significant fire activity
+#       4 = CRITICAL   — major fire event
+
+#     Thresholds derived from Algeria historical fire seasons.
+#     Revisit after first model training and adjust based on class balance.
+#     """
+#     conditions = [
+#         fire_count == 0,
+#         (fire_count >= 1) & (fire_count <= 2)  & (frp_sum < 50),
+#         (fire_count >= 1) & (fire_count <= 5)  & (frp_sum < 150),
+#         (fire_count >= 1) & (fire_count <= 15) & (frp_sum < 500),
+#     ]
+#     choices = [0, 1, 2, 3]
+#     return np.select(conditions, choices, default=4)
+
+
+# RISK_LABELS = {
+#     0: "NO_FIRE",
+#     1: "LOW",
+#     2: "MODERATE",
+#     3: "HIGH",
+#     4: "CRITICAL"
+# }
 def assign_risk_class(fire_count: pd.Series, frp_sum: pd.Series) -> pd.Series:
     """
-    Convert raw FIRMS detection counts and FRP into a 5-class risk label.
-
-    Classes:
-      0 = NO_FIRE    — no detections
-      1 = LOW        — 1-2 detections, low intensity
-      2 = MODERATE   — small cluster or moderate intensity
-      3 = HIGH       — significant fire activity
-      4 = CRITICAL   — major fire event
-
-    Thresholds derived from Algeria historical fire seasons.
-    Revisit after first model training and adjust based on class balance.
+    3-class risk label — collapsed from 5 to eliminate ambiguous middle boundaries.
+    
+    0 = NO_FIRE       — no detections
+    1 = ACTIVE        — 1-5 detections or FRP < 150 MW  (low-moderate activity)  
+    2 = SIGNIFICANT   — >5 detections or FRP >= 150 MW  (high-critical event)
     """
     conditions = [
         fire_count == 0,
-        (fire_count <= 2)  & (frp_sum < 50),
-        (fire_count <= 5)  & (frp_sum < 150),
-        (fire_count <= 15) & (frp_sum < 500),
+        (fire_count >= 1) & ((fire_count <= 5) & (frp_sum < 150)),
     ]
-    choices = [0, 1, 2, 3]
-    return np.select(conditions, choices, default=4)
+    choices = [0, 1]
+    return np.select(conditions, choices, default=2)
 
-
-RISK_LABELS = {
-    0: "NO_FIRE",
-    1: "LOW",
-    2: "MODERATE",
-    3: "HIGH",
-    4: "CRITICAL"
-}
-
+RISK_LABELS = {0: "NO_FIRE", 1: "ACTIVE", 2: "SIGNIFICANT"}
 
 # ── STEP 1: BUILD WILAYA × DAY SKELETON ──────────────────────────────────────
 
@@ -181,14 +196,28 @@ def join_era5(df: pd.DataFrame,
     centroids["centroid_lat"] = centroids.geometry.y
 
     # Get unique ERA5 cell locations from one day's data
-    era5_cells = era5[era5["date"] == era5["date"].min()][
-        ["era5_cell_id", "latitude", "longitude"]
-    ].drop_duplicates()
+    era5_cells = (era5[["era5_cell_id","latitude","longitude"]]
+              .drop_duplicates("era5_cell_id"))
 
     # For each wilaya centroid, find nearest ERA5 cell
-    from scipy.spatial import cKDTree
-    tree = cKDTree(era5_cells[["latitude", "longitude"]].values)
-    _, idx = tree.query(centroids[["centroid_lat", "centroid_lon"]].values)
+    from sklearn.neighbors import BallTree
+    import numpy as np
+
+    # BallTree expects coordinates in radians as (latitude, longitude)
+    era5_coords = np.radians(
+        era5_cells[["latitude", "longitude"]].to_numpy()
+    )
+
+    centroid_coords = np.radians(
+        centroids[["centroid_lat", "centroid_lon"]].to_numpy()
+    )
+
+    tree = BallTree(era5_coords, metric="haversine")
+
+    # k=1 -> nearest neighbour
+    _, idx = tree.query(centroid_coords, k=1)
+
+    idx = idx.ravel()
 
     wilaya_to_era5 = pd.DataFrame({
         "wilaya_id":    centroids["wilaya_id"].values,
