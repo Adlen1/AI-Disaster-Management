@@ -1,4 +1,3 @@
-# scripts/orchestrator.py
 """
 Pipeline Orchestrator
 
@@ -26,6 +25,7 @@ from ingest.osm      import OSMSource
 from ingest.firms    import FIRMSSource
 from ingest.era5     import ERA5Source
 from ingest.sentinel import SentinelSource
+from ingest.landcover import LandCoverSource
 
 
 def build_cfg(config: dict, key: str) -> dict:
@@ -35,32 +35,26 @@ def build_cfg(config: dict, key: str) -> dict:
 
 
 def preflight_check(config: dict, mode: str):
-    """
-    Verify credentials and required files exist before starting.
-    """
     import os
     errors = []
 
-    # FIRMS key
     if not os.getenv("FIRMS_MAP_KEY"):
         errors.append("FIRMS_MAP_KEY not set in .env")
 
-    # CDS API for ERA5
     cds_rc = Path.home() / ".cdsapirc"
     if not cds_rc.exists():
-        errors.append(f"ERA5: ~/.cdsapirc not found — register at cds.climate.copernicus.eu")
+        errors.append("ERA5-Land: ~/.cdsapirc not found — register at cds.climate.copernicus.eu")
 
-    # GEE project
     if not config["sentinel"].get("gee_project"):
         errors.append("Sentinel-2: sentinel.gee_project empty in config.yaml")
 
-    # Static files (only if we're going to run static sources)
     if mode == "train":
         static_checks = [
-            (config["gadm"]["paths"]["raw"],     config["gadm"]["filename_gpkg"],    "GADM"),
-            (config["dem"]["paths"]["raw"],      config["dem"]["filename"],           "DEM"),
-            (config["worldpop"]["paths"]["raw"], config["worldpop"]["filename"],      "WorldPop"),
-            (config["osm"]["paths"]["raw"],      config["osm"]["filename"],           "OSM"),
+            (config["gadm"]["paths"]["raw"],        config["gadm"]["filename_gpkg"],       "GADM"),
+            (config["dem"]["paths"]["raw"],          config["dem"]["filename"],              "DEM"),
+            (config["worldpop"]["paths"]["raw"],     config["worldpop"]["filename"],         "WorldPop"),
+            (config["osm"]["paths"]["raw"],          config["osm"]["filename"],              "OSM"),
+            # landcover downloads itself — no pre-existing file needed
         ]
         for raw_dir, filename, name in static_checks:
             path = Path(raw_dir) / filename
@@ -79,9 +73,9 @@ def preflight_check(config: dict, mode: str):
 
 def run_source(name: str, source, start_date=None, end_date=None):
     """
-    Run one source with failure isolation.
-    A failed source logs the error but doesn't kill the whole run.
-    Returns True if successful, False if failed.
+    - Run one source with failure isolation.
+    - A failed source logs the error but doesn't kill the whole run.
+    - Returns True if successful, False if failed.
     """
     print(f"\n{'─'*50}")
     print(f"  {name}")
@@ -102,7 +96,7 @@ def run_pipeline(mode: str, force_static: bool = False):
     with open("configs/config.yaml") as f:
         config = yaml.safe_load(f)
 
-    # ── Date windows per mode ─────────────────────────────────────────────────
+    # Date windows per mode 
     if mode == "train":
         start_date = config["training"]["start_date"]
         end_date   = config["training"]["end_date"]
@@ -130,7 +124,7 @@ def run_pipeline(mode: str, force_static: bool = False):
     else:
         print(f"  FIRMS:    {firms_start} (NRT)")
         
-        print(f"  ERA5:     {era5_start} → {era5_end} (ERA5T)")
+        print(f"  ERA5-Land: {era5_start} → {era5_end} (ERA5T 9km)")
         
         print(f"  Sentinel: {sentinel_start} → {sentinel_end}")
     
@@ -140,7 +134,7 @@ def run_pipeline(mode: str, force_static: bool = False):
 
     results = {}
 
-    # ── Static sources — training/setup only ──────────────────────────────────
+    # Static sources — training/setup only 
     # Never re-run in operational mode — they never change day-to-day
     if mode == "train" or force_static:
         print("\nSTATIC SOURCES (run once)")
@@ -156,12 +150,15 @@ def run_pipeline(mode: str, force_static: bool = False):
         results["worldpop"] = run_source("WorldPop", WorldPopSource(build_cfg(config, "worldpop")))
         results["osm"]      = run_source("OSM Roads",OSMSource(build_cfg(config, "osm")))
 
-    # ── Dynamic sources ───────────────────────────────────────────────────────
+        
+        results["landcover"] = run_source("Land Cover",LandCoverSource(build_cfg(config, "landcover")))  
+
+    # Dynamic sources 
     print("\nDYNAMIC SOURCES")
 
     if mode == "train":
-        # Training — all use _SP (standard processing, science quality)
-        # FIRMS: curate() reads pre-downloaded historical CSVs
+        #Training — all use _SP (standard processing, science quality)
+        #FIRMS: curate() reads pre-downloaded historical CSVs
         results["firms"] = run_source(
             "FIRMS (historical)",
             FIRMSSource(build_cfg(config, "firms")),
@@ -187,7 +184,6 @@ def run_pipeline(mode: str, force_static: bool = False):
         op_config = config.copy()
         op_config["firms"] = config["firms"].copy()
         op_config["firms"]["sensors"] = [
-            "MODIS_NRT",
             "VIIRS_SNPP_NRT",
             "VIIRS_NOAA20_NRT",
             "VIIRS_NOAA21_NRT",
@@ -212,7 +208,7 @@ def run_pipeline(mode: str, force_static: bool = False):
             end_date=sentinel_end
         )
 
-    # ── Summary ───────────────────────────────────────────────────────────────
+    # Summary 
     print(f"\n{'='*55}")
     print(f"  Run summary — mode: {mode.upper()}")
     print(f"{'='*55}")

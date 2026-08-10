@@ -16,5 +16,11 @@ cdsapi
 netCDF4
 earthengine-api
 geemap
-# shapely
-# python-dateutil
+jupyter 
+ipykernel
+seaborn
+lightgbm
+xgboost
+catboost
+shap
+mapclassify

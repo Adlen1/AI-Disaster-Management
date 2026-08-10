@@ -1,14 +1,9 @@
 """
-OSM Roads — Static Data Source
+OpenSTreetMap (OSM) — Static Data Source
 
-Ingestion:  confirms .pbf file exists
-Curation:   reads road network from .pbf
-            filters to major roads only
-            reprojects to EPSG:4326
-            computes distance-to-nearest-road raster
-            saves:
-              curated/roads/roads.gpkg         ← road network
-              curated/roads/road_distance.tif  ← distance raster (km)
+Output files:
+    curated/roads/roads.gpkg         ← road network
+    curated/roads/road_distance.tif  ← distance raster (km)
 """
 
 import numpy as np
@@ -27,7 +22,9 @@ from utils.grid import get_algeria_grid
 class OSMSource(DataSource):
 
     def ingest(self, start_date=None, end_date=None):
-        """Static — confirm .pbf file exists."""
+        """
+        - confirms .pbf file exists
+        """
         pbf_path = self.raw_dir / self.config["osm"]["filename"]
 
         if not pbf_path.exists():
@@ -41,19 +38,21 @@ class OSMSource(DataSource):
 
     def curate(self):
         """
-        Extract roads from .pbf, compute distance raster.
-        Uses pyogrio to read from .pbf directly.
+        - reads road network from .pbf
+        - filters to major roads only
+        - reprojects to EPSG:4326
+        - computes distance-to-nearest-road raster
         """
         pbf_path      = self.raw_dir / self.config["osm"]["filename"]
         out_dir       = Path(self.config["osm"]["paths"]["curated"])
         boundary_path = Path(self.config["gadm"]["paths"]["curated"]) / "algeria_country.gpkg"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # ── Load Algeria boundary ─────────────────────────────────────────────
+        # Load Algeria boundary 
         algeria = gpd.read_file(boundary_path).to_crs("EPSG:4326")
         bbox    = tuple(algeria.total_bounds)  # (minx, miny, maxx, maxy)
 
-        # ── Read roads from .pbf ──────────────────────────────────────────────
+        # Read roads from .pbf 
         self.logger.info("Reading roads from OSM .pbf (this may take 2-5 minutes)")
         try:
             roads = gpd.read_file(
@@ -69,7 +68,7 @@ class OSMSource(DataSource):
 
         self.logger.info(f"Total road features: {len(roads)}")
 
-        # ── Filter to major roads ─────────────────────────────────────────────
+        # Filter to major roads 
         # highway tag defines road type in OSM
         major_types = [
             "motorway", "trunk", "primary", "secondary", "tertiary",
@@ -82,18 +81,18 @@ class OSMSource(DataSource):
         else:
             self.logger.warning("No 'highway' column found — keeping all lines")
 
-        # ── Clip to Algeria ───────────────────────────────────────────────────
+        # Clip to Algeria 
         roads = roads.to_crs("EPSG:4326")
         roads = gpd.clip(roads, algeria)
         self.logger.info(f"Roads after clipping to Algeria: {len(roads)}")
 
-        # ── Save road network ─────────────────────────────────────────────────
+        # Save road network
         roads_path = out_dir / "roads.gpkg"
         roads[["geometry", "highway"] if "highway" in roads.columns 
               else ["geometry"]].to_file(roads_path, driver="GPKG")
         self.logger.info(f"Saved road network → {roads_path}")
 
-        # ── Compute distance-to-road raster ──────────────────────────────────
+        # Compute distance-to-road raster 
         self.logger.info("Computing distance-to-road raster")
 
         grid = get_algeria_grid(boundary_path, self.config["algeria"]["grid_resolution_m"])
@@ -114,7 +113,7 @@ class OSMSource(DataSource):
             f"Distance range: {dist_km.min():.1f} → {dist_km.max():.1f} km"
         )
 
-        # ── Save distance raster ──────────────────────────────────────────────
+        # Save distance raster
         dist_path = out_dir / "road_distance.tif"
         with rasterio.open(dist_path, "w", **{
             "driver":    "GTiff",

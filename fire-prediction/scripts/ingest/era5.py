@@ -1,21 +1,10 @@
 # scripts/ingest/era5.py
 """
-ERA5 — Meteorological Reanalysis (Dynamic)
+Meteorological Reanalysis (ERA5) — Dynamic Data Source
 
-Key architectural decision:
-  ERA5 native resolution is ~31km.
-  We do NOT interpolate to the 1km terrain grid here.
-  Instead we keep ERA5 at its native grid (~31km cells over Algeria)
-  and store (date, era5_cell_id, lat, lon, weather_vars).
-
-Output:
-  raw/era5/era5_YYYYMM.nc           <- one NetCDF per month
-  
-  curated/era5/era5_YYYYMMDD_YYYYMMDD.parquet
-  -> columns: date, era5_cell_id, lat, lon,
-              temp_c, rh, wind_speed_kmh, wind_dir,
-              precip_mm, soil_moisture,
-              FFMC, DMC, DC, ISI, BUI, FWI
+Output files:
+    raw/era5/era5_YYYYMM.nc        
+    curated/era5/era5_YYYYMMDD_YYYYMMDD.parquet
 """
 import shutil
 import sys
@@ -36,12 +25,14 @@ from utils.base import DataSource
 from utils.base import filter_fire_season
 
 
-# ── FWI VECTORIZED COMPUTATION (Algeria Adjusted) ─────────────────────────────
+# ── FWI VECTORIZED COMPUTATION ─────────────────────────────
 # Canadian Fire Weather Index — Van Wagner (1987)
 # Optimized with full vector calculations across spatial grid cell indices.
 
 def compute_relative_humidity(temp_k: np.ndarray, dewpoint_k: np.ndarray) -> np.ndarray:
-    """Derive RH (%) from temperature and dewpoint (Kelvin)."""
+    """
+    - Derive RH (%) from temperature and dewpoint (Kelvin).
+    """
     temp_c = temp_k - 273.15
     dew_c  = dewpoint_k - 273.15
     rh = 100 * (
@@ -52,17 +43,23 @@ def compute_relative_humidity(temp_k: np.ndarray, dewpoint_k: np.ndarray) -> np.
 
 
 def compute_wind_speed_kmh(u: np.ndarray, v: np.ndarray) -> np.ndarray:
-    """Wind speed in km/h from ERA5 U/V components (m/s). FWI needs km/h."""
+    """
+    - Wind speed in km/h from ERA5 U/V components (m/s). FWI needs km/h.
+    """
     return np.sqrt(u**2 + v**2) * 3.6
 
 
 def compute_wind_direction(u: np.ndarray, v: np.ndarray) -> np.ndarray:
-    """Wind direction in degrees (meteorological convention, 0=North)."""
+    """
+    - Wind direction in degrees (meteorological convention, 0=North).
+    """
     return (270 - np.degrees(np.arctan2(v, u))) % 360
 
 
 def _ffmc_vectorized(temp: np.ndarray, rh: np.ndarray, wind_kmh: np.ndarray, rain: np.ndarray, prev_ffmc: np.ndarray) -> np.ndarray:
-    """Vectorized Fine Fuel Moisture Code across all active cells."""
+    """
+    - Vectorized Fine Fuel Moisture Code across all active cells.
+    """
     rh       = np.clip(rh, 0.0, 100.0)
     wind_kmh = np.maximum(0.0, wind_kmh)
     rain     = np.maximum(0.0, rain)
@@ -111,7 +108,9 @@ def _ffmc_vectorized(temp: np.ndarray, rh: np.ndarray, wind_kmh: np.ndarray, rai
 
 
 def _dmc_vectorized(temp: np.ndarray, rh: np.ndarray, rain: np.ndarray, month: int, prev_dmc: np.ndarray) -> np.ndarray:
-    """Vectorized Duff Moisture Code incorporating Mediterranean Day-Lengths."""
+    """
+    - Vectorized Duff Moisture Code incorporating Mediterranean Day-Lengths.
+    """
     rh   = np.clip(rh, 0.0, 100.0)
     rain = np.maximum(0.0, rain)
 
@@ -156,7 +155,9 @@ def _dmc_vectorized(temp: np.ndarray, rh: np.ndarray, rain: np.ndarray, month: i
 
 
 def _dc_vectorized(temp: np.ndarray, rain: np.ndarray, month: int, prev_dc: np.ndarray) -> np.ndarray:
-    """Vectorized Drought Code incorporating Mediterranean Drying Factors."""
+    """
+    - Vectorized Drought Code incorporating Mediterranean Drying Factors.
+    """
     rain = np.maximum(0.0, rain)
 
     # Wetting Phase (precipitation > 2.8 mm)
@@ -181,7 +182,9 @@ def _dc_vectorized(temp: np.ndarray, rain: np.ndarray, month: int, prev_dc: np.n
 
 
 def _isi_vectorized(wind_kmh: np.ndarray, ffmc_val: np.ndarray) -> np.ndarray:
-    """Vectorized Initial Spread Index."""
+    """
+    - Vectorized Initial Spread Index.
+    """
     wind_kmh = np.maximum(0.0, wind_kmh)
     m = 147.2 * (101.0 - ffmc_val) / (59.5 + ffmc_val)
     m = np.maximum(m, 0.0)
@@ -192,7 +195,9 @@ def _isi_vectorized(wind_kmh: np.ndarray, ffmc_val: np.ndarray) -> np.ndarray:
 
 
 def _bui_vectorized(dmc_val: np.ndarray, dc_val: np.ndarray) -> np.ndarray:
-    """Vectorized Buildup Index explicitly resolving edge cases."""
+    """
+    - Vectorized Buildup Index explicitly resolving edge cases.
+    """
     dmc_val = np.maximum(dmc_val, 0.0)
     dc_val  = np.maximum(dc_val, 0.0)
 
@@ -207,7 +212,9 @@ def _bui_vectorized(dmc_val: np.ndarray, dc_val: np.ndarray) -> np.ndarray:
 
 
 def _fwi_vectorized(isi_val: np.ndarray, bui_val: np.ndarray) -> np.ndarray:
-    """Vectorized Fire Weather Index without fractional power warnings."""
+    """
+    - Vectorized Fire Weather Index without fractional power warnings.
+    """
     isi_val = np.maximum(isi_val, 0.0)
     bui_val = np.maximum(bui_val, 0.0)
 
@@ -237,10 +244,7 @@ RESET_GAP_DAYS = 35
 
 def compute_fwi_series(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute FWI components vectorized across all ERA5 grid cells.
-
-    Notes
-    -----
+    - Compute FWI components vectorized across all ERA5 grid cells.
     - Vectorized across all ERA5 cells for each day.
     - Loops only over dates because FFMC/DMC/DC are recursive.
     - Automatically resets moisture codes after a long gap
@@ -280,10 +284,8 @@ def compute_fwi_series(df: pd.DataFrame) -> pd.DataFrame:
 
         idx = cell_idx.loc[day_df["era5_cell_id"]].to_numpy()
 
-        # ------------------------------------------------------------
         # Reset cells whose previous observation is too far away
         # (i.e. crossed the skipped off-season)
-        # ------------------------------------------------------------
         seen = ~np.isnat(last_seen[idx])
 
         if np.any(seen):
@@ -366,7 +368,7 @@ def compute_fwi_series(df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat(results, ignore_index=True)
 
 
-# ── ERA5 SOURCE ───────────────────────────────────────────────────────────────
+# ERA5 SOURCE 
 
 class ERA5Source(DataSource):
 
@@ -381,7 +383,7 @@ class ERA5Source(DataSource):
 
     def ingest(self, start_date: str = None, end_date: str = None):
         """
-        Download ERA5 monthly NetCDF files for Algeria.
+        - Download ERA5 monthly NetCDF files for Algeria.
         """
         if not start_date:
             start_date = datetime.today().strftime("%Y-%m-%d")
@@ -432,7 +434,7 @@ class ERA5Source(DataSource):
             self.logger.info(f"Downloading ERA5: {year_str}-{month_str}")
             try:
                 c.retrieve(
-                    "reanalysis-era5-single-levels",
+                    "reanalysis-era5-land",
                     {
                         "product_type": "reanalysis",
                         "variable": self.CDS_VARIABLES,
@@ -514,7 +516,11 @@ class ERA5Source(DataSource):
         return ds
 
     def curate(self):
-        """Process monthly NetCDF files into native curated Parquet rows."""
+        """
+        - Process monthly NetCDF files into native curated Parquet rows.
+        - Handles: in_algeria mask, precipitation accumulation fix,
+        NaN border cells, FWI computation, fire season filter.
+        """
         out_dir = Path(self.config["era5"]["paths"]["curated"])
         boundary_path = Path(self.config["gadm"]["paths"]["curated"]) / "algeria_country.gpkg"
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -528,83 +534,94 @@ class ERA5Source(DataSource):
         algeria = gpd.read_file(boundary_path).to_crs("EPSG:4326")
         algeria_geom = algeria.geometry.union_all()
 
+        # COMPUTE in_algeria MASK ONCE 
+        first_ds = self._open_era5_file(nc_files[0])
+        lats = first_ds.latitude.values
+        lons = first_ds.longitude.values
+        first_ds.close()
+
+        lon_grid, lat_grid = np.meshgrid(lons, lats)
+        flat_lons = lon_grid.flatten()
+        flat_lats = lat_grid.flatten()
+
+        points = gpd.GeoDataFrame(
+            geometry=gpd.points_from_xy(flat_lons, flat_lats),
+            crs="EPSG:4326"
+        )
+        in_algeria = points.within(algeria_geom).values
+        cell_lons  = flat_lons[in_algeria]
+        cell_lats  = flat_lats[in_algeria]
+        cell_ids   = np.where(in_algeria)[0]
+
+        self.logger.info(
+            f"ERA5 cells inside Algeria: {len(cell_ids)} (from {len(flat_lons)} total)"
+        )
+
         all_months = []
 
         for nc_file in nc_files:
             self.logger.info(f"Processing {nc_file.name}")
             ds = self._open_era5_file(nc_file)
 
-            lats = ds.latitude.values
-            lons = ds.longitude.values
-
-            lon_grid, lat_grid = np.meshgrid(lons, lats)
-            flat_lons = lon_grid.flatten()
-            flat_lats = lat_grid.flatten()
-
-            in_algeria = np.array([
-                algeria_geom.contains(Point(lo, la))
-                for lo, la in zip(flat_lons, flat_lats)
-            ])
-            cell_lons = flat_lons[in_algeria]
-            cell_lats = flat_lats[in_algeria]
-            cell_ids = np.where(in_algeria)[0]
-
-            self.logger.info(f"  ERA5 cells inside Algeria: {len(cell_ids)} (from {len(flat_lons)} total)")
-
             times = pd.to_datetime(ds.time.values)
             dates = pd.DatetimeIndex(np.unique(times.date))
 
             for date in dates:
-                date_str = str(date.date())
-                date_mask = times.date == date.date()
-                day_ds = ds.isel(time=date_mask)
+                date_str   = str(date.date())
+                date_mask  = times.date == date.date()
+                day_ds     = ds.isel(time=date_mask)
+                day_times  = times[date_mask]
 
-                # Precipitation 24h accumulation
+                #  PRECIPITATION: max of daily accumulation (ERA5-Land tp is a running accumulation from 00:00 UTC)
                 if "tp" in ds:
-                    precip_daily = day_ds["tp"].values.sum(axis=0) * 1000.0  # m -> mm
-                    precip_flat = precip_daily.flatten()[in_algeria]
+                    precip_daily = day_ds["tp"].values.max(axis=0) * 1000.0  # m → mm
+                    precip_flat  = np.clip(
+                        precip_daily.flatten()[in_algeria], 0.0, None
+                    )
                 else:
                     precip_flat = np.zeros(len(cell_ids))
 
-                # Meteorological observation snapshot at noon (11:00 UTC / 12:00 Algeria local)
-                hour_mask = times.hour == 11
-                date_hour_mask = date_mask & hour_mask
-                if date_hour_mask.sum() == 0:
-                    date_hour_mask = date_mask & (times.hour == 12)
-                if date_hour_mask.sum() == 0:
-                    self.logger.warning(f"  No solar-noon data for {date_str} — skipping")
+                # NOON SNAPSHOT: 11:00 UTC (12:00 Algeria local)
+                hour_mask = day_times.hour == 11
+                if hour_mask.sum() == 0:
+                    hour_mask = day_times.hour == 12
+                if hour_mask.sum() == 0:
+                    self.logger.warning(
+                        f"  No solar-noon data for {date_str} — skipping"
+                    )
                     continue
 
-                noon_ds = ds.isel(time=np.where(date_hour_mask)[0][0])
+                noon_idx  = np.where(hour_mask)[0][0]
+                noon_ds   = day_ds.isel(time=noon_idx)
 
                 def extract(var):
                     if var in ds:
                         return noon_ds[var].values.flatten()[in_algeria]
                     return np.full(len(cell_ids), np.nan)
 
-                temp_k = extract("t2m")
+                temp_k     = extract("t2m")
                 dewpoint_k = extract("d2m")
-                u10 = extract("u10")
-                v10 = extract("v10")
+                u10        = extract("u10")
+                v10        = extract("v10")
                 soil_moist = extract("swvl1")
 
-                temp_c = temp_k - 273.15
-                rh = compute_relative_humidity(temp_k, dewpoint_k)
+                temp_c         = temp_k - 273.15
+                rh             = compute_relative_humidity(temp_k, dewpoint_k)
                 wind_speed_kmh = compute_wind_speed_kmh(u10, v10)
-                wind_dir = compute_wind_direction(u10, v10)
+                wind_dir       = compute_wind_direction(u10, v10)
 
                 day_df = pd.DataFrame({
-                    "date": date_str,
-                    "era5_cell_id": cell_ids,
-                    "latitude": cell_lats,
-                    "longitude": cell_lons,
-                    "temp_c": temp_c.round(2),
-                    "rh": rh.round(2),
+                    "date"          : date_str,
+                    "era5_cell_id"  : cell_ids,
+                    "latitude"      : cell_lats,
+                    "longitude"     : cell_lons,
+                    "temp_c"        : temp_c.round(2),
+                    "rh"            : rh.round(2),
                     "wind_speed_kmh": wind_speed_kmh.round(2),
-                    "wind_dir": wind_dir.round(1),
-                    "precip_mm": np.clip(precip_flat, 0.0, None).round(2),
-                    "soil_moisture": soil_moist.round(4),
-                    "month": date.month,
+                    "wind_dir"      : wind_dir.round(1),
+                    "precip_mm"     : precip_flat.round(2),
+                    "soil_moisture" : soil_moist.round(4),
+                    "month"         : date.month,
                 })
 
                 all_months.append(day_df)
@@ -614,29 +631,80 @@ class ERA5Source(DataSource):
         df = pd.concat(all_months, ignore_index=True)
         df["date"] = pd.to_datetime(df["date"])
 
-        self.logger.info(f"Combined: {df.shape} | cells: {df['era5_cell_id'].nunique()} | dates: {df['date'].nunique()}")
+        #  DEDUP (safeguard against overlapping ingest runs) 
+        before = len(df)
+        df = df.drop_duplicates(subset=["date", "era5_cell_id"], keep="last")
+        if len(df) < before:
+            self.logger.warning(
+                f"Dropped {before - len(df)} duplicate (date, era5_cell_id) rows"
+            )
 
+        self.logger.info(
+            f"Combined: {df.shape} | "
+            f"cells: {df['era5_cell_id'].nunique()} | "
+            f"dates: {df['date'].nunique()}"
+        )
+
+        #  FILL NaN BORDER CELLS before FWI 
+        # 11 edge cells have no noon data on any date — fill from spatial
+        # median of their date to avoid propagating NaN through FWI computation.
+        met_cols = ["temp_c", "rh", "wind_speed_kmh", "wind_dir",
+                    "precip_mm", "soil_moisture"]
+        nan_counts = df[met_cols].isna().sum()
+        if nan_counts.any():
+            self.logger.warning(
+                f"NaN met values before FWI — filling with daily spatial median:\n"
+                f"{nan_counts[nan_counts > 0].to_dict()}"
+            )
+            for col in met_cols:
+                if df[col].isna().any():
+                    daily_median = df.groupby("date")[col].transform("median")
+                    df[col] = df[col].fillna(daily_median)
+
+            # If still NaN (entire date missing), fill with column median
+            for col in met_cols:
+                if df[col].isna().any():
+                    df[col] = df[col].fillna(df[col].median())
+                    self.logger.warning(
+                        f"  {col}: still NaN after daily fill — "
+                        f"used global median as fallback"
+                    )
+
+        # FWI (must run before season filter — codes have memory) 
         self.logger.info("Computing FWI components (vectorized)...")
         df = compute_fwi_series(df)
 
+        # FWI SANITY LOG 
+        n_extreme = (df["FWI"] > 200).sum()
+        if n_extreme > 0:
+            self.logger.warning(
+                f"{n_extreme} rows with FWI > 200 (extreme but physically possible) — "
+                f"sample: {df[df['FWI']>200][['date','era5_cell_id','FWI']].head(3).to_dict('records')}"
+            )
+
         self.logger.info(f"Final shape: {df.shape}")
-        self.logger.info(f"Date range: {df['date'].min()} -> {df['date'].max()}")
-        self.logger.info(f"FWI range: {df['FWI'].min():.1f} -> {df['FWI'].max():.1f}")
-        
-        fire_months_cfg = self.config.get("training", {}).get("fire_season_months", [7, 8, 9])
+        self.logger.info(f"Date range:  {df['date'].min().date()} -> {df['date'].max().date()}")
+        self.logger.info(f"FWI range:   {df['FWI'].min():.1f} -> {df['FWI'].max():.1f}")
+
+        fire_months_cfg = self.config.get("training", {}).get(
+            "fire_season_months", [7, 8, 9]
+        )
         fire_season = df[df["month"].isin(fire_months_cfg)]
         off_season  = df[~df["month"].isin(fire_months_cfg)]
-        
-        off_season_avg = f"{off_season['FWI'].mean():.1f}" if len(off_season) > 0 else "n/a"
+        off_season_avg = (
+            f"{off_season['FWI'].mean():.1f}" if len(off_season) > 0 else "n/a"
+        )
         self.logger.info(
-            f"Fire season avg FWI: {fire_season['FWI'].mean():.1f} (vs off-season: {off_season_avg})"
+            f"Fire season avg FWI: {fire_season['FWI'].mean():.1f} "
+            f"(vs off-season: {off_season_avg})"
         )
 
+        # FIRE SEASON FILTER (after FWI) 
         df = filter_fire_season(df, self.config, date_col="date")
 
         start_str = df["date"].min().strftime("%Y%m%d")
-        end_str = df["date"].max().strftime("%Y%m%d")
-        out_path = out_dir / f"era5_{start_str}_{end_str}.parquet"
+        end_str   = df["date"].max().strftime("%Y%m%d")
+        out_path  = out_dir / f"era5_{start_str}_{end_str}.parquet"
         df.to_parquet(out_path, index=False)
         self.logger.info(f"Saved → {out_path}")
 
@@ -650,7 +718,7 @@ class ERA5Source(DataSource):
         self.logger.info(f"Loaded ERA5: {df.shape}")
         return df
 
-
+# ── Run standalone ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import yaml
     from utils.logger import setup_logger
@@ -662,7 +730,7 @@ if __name__ == "__main__":
     config["paths"] = config["era5"]["paths"]
     source = ERA5Source(config)
 
-    source.ingest(start_date="2015-06-01", end_date="2015-06-30")
+    source.ingest(start_date="2015-06-01", end_date="2020-12-30")
     source.curate()
 
     df = source.load()

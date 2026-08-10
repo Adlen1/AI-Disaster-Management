@@ -1,16 +1,11 @@
 # scripts/ingest/dem.py
 """
-DEM — Digital Elevation Model (Static)
+Digital Elevation Model (DEM) — Static Data Source
 
-Ingestion:  confirms DEM file exists
-Curation:   clips to Algeria boundary
-            reprojects to EPSG:4326
-            resamples to canonical 1km grid (from algeria.grid_resolution_m)
-            computes slope and aspect
-            saves 3 GeoTIFFs:
-              curated/dem/elevation.tif
-              curated/dem/slope.tif
-              curated/dem/aspect.tif
+Output files:
+    curated/dem/elevation.tif
+    curated/dem/slope.tif
+    curated/dem/aspect.tif
 """
 
 import numpy as np
@@ -52,7 +47,9 @@ def compute_slope_aspect(elevation: np.ndarray, resolution_m: float):
 class DEMSource(DataSource):
 
     def ingest(self, start_date=None, end_date=None):
-        """Static — confirm GEE-exported DEM file exists."""
+        """
+        - Confirms GEE-exported DEM file exists
+        """
         dem_path = self.raw_dir / self.config["dem"]["filename"]
         if not dem_path.exists():
             raise FileNotFoundError(
@@ -64,19 +61,25 @@ class DEMSource(DataSource):
             self.logger.info(f"  CRS: {src.crs} | Shape: {src.shape} | Res: {src.res}")
 
     def curate(self):
+        """
+        - Clips to Algeria boundary
+        - Reprojects to EPSG:4326
+        - Resamples to canonical 1km grid (from algeria.grid_resolution_m)
+        - Computes slope and aspect
+        """
         dem_path      = self.raw_dir / self.config["dem"]["filename"]
         out_dir       = Path(self.config["dem"]["paths"]["curated"])
         boundary_path = Path(self.config["gadm"]["paths"]["curated"]) / "algeria_country.gpkg"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # ── Canonical grid — uses algeria.grid_resolution_m ──────────────────
+        # Canonical grid — uses algeria.grid_resolution_m 
         res_m = self.config["algeria"]["grid_resolution_m"]
         grid  = get_algeria_grid(boundary_path, res_m)
         self.logger.info(
             f"Grid: {grid.width}×{grid.height} cells at {grid.res_m}m"
         )
 
-        # ── Clip to Algeria ───────────────────────────────────────────────────
+        # Clip to Algeria 
         algeria = gpd.read_file(boundary_path).to_crs("EPSG:4326")
 
         with rasterio.open(dem_path) as src:
@@ -89,7 +92,7 @@ class DEMSource(DataSource):
 
         self.logger.info(f"Clipped — valid pixels: {np.sum(~np.isnan(clipped))}")
 
-        # ── Reproject and align to canonical grid ─────────────────────────────
+        # Reproject and align to canonical grid
         elevation = grid.empty_array()
         reproject(
             source=clipped,
@@ -106,7 +109,7 @@ class DEMSource(DataSource):
             f"Elevation: {np.nanmin(elevation):.0f}m → {np.nanmax(elevation):.0f}m"
         )
 
-        # ── Compute slope and aspect ──────────────────────────────────────────
+        # Compute slope and aspect 
         elev_filled           = np.where(np.isnan(elevation), 0, elevation)
         slope_deg, aspect_deg = compute_slope_aspect(elev_filled, grid.res_m)
         nan_mask              = np.isnan(elevation)
@@ -116,7 +119,7 @@ class DEMSource(DataSource):
             f"Slope: {np.nanmin(slope_deg):.1f}° → {np.nanmax(slope_deg):.1f}°"
         )
 
-        # ── Save ──────────────────────────────────────────────────────────────
+        # Save
         for name, array in [
             ("elevation", elevation),
             ("slope",     slope_deg),

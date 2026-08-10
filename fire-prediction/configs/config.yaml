@@ -18,7 +18,8 @@ gadm:
   filename_gpkg: "gadm41_DZA.gpkg"
   admin_levels:
     - 0   # country
-    - 1   # wilaya (48 wilayas)
+    - 1   # wilaya 
+    - 2   # commune
 
 dem:
   paths:
@@ -37,6 +38,14 @@ osm:
     raw:     data/raw/roads
     curated: data/curated/roads
   filename: "algeria-260706.osm.pbf"
+
+landcover:
+  paths:
+    raw:     data/raw/landcover
+    curated: data/curated/landcover
+  source: "ESA WorldCover 2021"
+  resolution_m: 10
+  year: 2021
 
 era5:
   paths:
@@ -62,7 +71,6 @@ firms:
     raw:     data/raw/firms
     curated: data/curated/firms
   sensors:
-    - MODIS_SP
     - VIIRS_SNPP_SP
     - VIIRS_NOAA20_SP
     - VIIRS_NOAA21_SP
@@ -79,6 +87,6 @@ logging:
 # All dynamic sources use these same bounds.
 training:
   start_date:       "2015-06-01"
-  end_date:         "2025-10-31"
+  end_date:         "2020-10-31"
   fire_season_only: true
   fire_season_months: [5, 6, 7, 8, 9, 10]   # May → October

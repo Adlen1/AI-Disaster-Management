@@ -1,9 +1,8 @@
 """
-NASA FIRMS — Fire Archive + NRT (Dynamic)
+NASA FIRMS (Fire archive + NRT) — Dynamic Data Source
 
-For new data: set FIRMS_MAP_KEY in .env then call ingest(start, end)
-
-Output: curated/firms/firms_algeria_YYYYMMDD_YYYYMMDD.parquet
+Output files:
+    curated/firms/firms_curated.parquet
 """
 
 import os
@@ -36,12 +35,10 @@ class FIRMSSource(DataSource):
     BASE_URL      = "https://firms.modaps.eosdis.nasa.gov/api/area/csv"
     MAX_DAYS_ARCH = 5   # max days per API call for archive sensors (_SP)
 
-    # ── INGESTION ─────────────────────────────────────────────────────────────
-
     def ingest(self, start_date: str = None, end_date: str = None):
         """
-        Download FIRMS data for Algeria via API.
-        Skip this if data already in raw/firms/ as CSV.
+        - Download FIRMS data for Algeria via API.
+        - Skip this if data already in raw/firms/ as CSV.
         """
         map_key = os.getenv("FIRMS_MAP_KEY")
         if not map_key:
@@ -52,7 +49,7 @@ class FIRMSSource(DataSource):
 
         bbox_list = self.config["algeria"]["bbox"]
         bbox = ",".join(str(x) for x in bbox_list)
-        
+
         sensors = self.config["firms"]["sensors"]
 
         if not start_date:
@@ -69,7 +66,6 @@ class FIRMSSource(DataSource):
             f"({total_days} days, {len(sensors)} sensors)"
         )
 
-        # Skip if raw files already exist
         existing = list(self.raw_dir.glob("*.csv"))
         if existing:
             self.logger.info(
@@ -78,7 +74,6 @@ class FIRMSSource(DataSource):
             )
             return
 
-        # Fire season filter for API ingestion
         fire_months = self.config.get("training", {}).get(
             "fire_season_months", list(range(1, 13))
         )
@@ -90,7 +85,6 @@ class FIRMSSource(DataSource):
             with tqdm(total=total_days, desc=f"{sensor}", unit="days") as pbar:
                 while chunk_start <= end:
 
-                    # Jump entire non-fire-season months
                     if chunk_start.month not in fire_months:
                         if chunk_start.month == 12:
                             next_month = chunk_start.replace(year=chunk_start.year + 1, month=1, day=1)
@@ -130,136 +124,202 @@ class FIRMSSource(DataSource):
             else:
                 self.logger.warning(f"No data returned for {sensor}")
 
-    # ── CURATION ──────────────────────────────────────────────────────────────
-
     def curate(self):
         """
-        Process all CSV files in raw/firms/ — both archive and NRT.
-        Works on already-downloaded files without needing the API.
+        - Clean, validate, and filter FIRMS detections. VIIRS only.
+        - Handles: sensor filter, confidence, zero-FRP, gas flares,
+        Saharan low-FRP, dedup, spatial join to communes.
         """
-        out_dir   = Path(self.config["firms"]["paths"]["curated"])
-        out_dir.mkdir(parents=True, exist_ok=True)
+        import glob
 
-        csv_files = sorted(self.raw_dir.glob("*.csv"))
+        self.logger.info("Loading raw FIRMS CSV files...")
+
+        csv_files = glob.glob(str(self.raw_dir / "*.csv"))
         if not csv_files:
-            raise FileNotFoundError(
-                f"No CSV files in {self.raw_dir}\n"
-                f"Either run ingest() or copy your downloaded FIRMS CSVs here."
-            )
+            raise FileNotFoundError(f"No CSV files in {self.raw_dir}")
 
-        self.logger.info(f"Loading {len(csv_files)} FIRMS CSV files")
-
-        # ── Load all CSVs ─────────────────────────────────────────────────────
         dfs = []
-        for f in csv_files:
-            try:
-                df = pd.read_csv(f, low_memory=False)
-                df["source_file"] = f.name
-                dfs.append(df)
-                self.logger.debug(f"  {f.name}: {len(df)} rows")
-            except Exception as e:
-                self.logger.warning(f"  Skipping {f.name}: {e}")
+        for csv in csv_files:
+            df_part = pd.read_csv(csv)
+            dfs.append(df_part)
+            self.logger.info(f"Loaded {csv}: {len(df_part)} rows")
 
         df = pd.concat(dfs, ignore_index=True)
-        self.logger.info(f"Combined: {len(df)} rows")
+        self.logger.info(f"Total rows loaded: {len(df)}")
 
-        # ── Parse dates ───────────────────────────────────────────────────────
+        # STANDARDIZE 
+        df.columns = df.columns.str.lower().str.strip()
         df["acq_date"] = pd.to_datetime(df["acq_date"])
+        if "acq_time" in df.columns:
+            df["acq_time"] = df["acq_time"].astype(str).str.zfill(4)
 
-        # ── Confidence filter — VIIRS and MODIS use different formats ─────────
-        viirs_mask = df["instrument"].str.upper().str.contains("VIIRS", na=False)
-        modis_mask = df["instrument"].str.upper().str.contains("MODIS", na=False)
+        # VIIRS ONLY
+        n_before = len(df)
+        if "instrument" in df.columns:
+            viirs_mask = (
+                df["instrument"].str.upper().str.contains("VIIRS", na=False) |
+                df["instrument"].str.upper().isin(
+                    ["SNPP", "NOAA-20", "NOAA-21", "N20", "N21"]
+                )
+            )
+        elif "satellite" in df.columns:
+            viirs_mask = df["satellite"].str.upper().isin(
+                ["N", "1", "SNPP", "N20", "N21", "NOAA-20", "NOAA-21"]
+            )
+        else:
+            viirs_mask = pd.Series(True, index=df.index)
 
-        viirs = df[viirs_mask].copy()
-        modis = df[modis_mask].copy()
-        other = df[~viirs_mask & ~modis_mask].copy()
+        df = df[viirs_mask].copy()
+        self.logger.info(f"VIIRS filter: {n_before} → {len(df)}")
 
-        # VIIRS: string labels
-        n = len(viirs)
-        viirs = viirs[viirs["confidence"].astype(str).isin(["n", "h"])]
-        self.logger.info(f"VIIRS confidence: {n} → {len(viirs)} (dropped {n - len(viirs)})")
-
-        # MODIS: integer 0-100
-        n = len(modis)
-        modis["confidence"] = pd.to_numeric(modis["confidence"], errors="coerce")
-        modis = modis[modis["confidence"] >= 50]
-        self.logger.info(f"MODIS confidence: {n} → {len(modis)} (dropped {n - len(modis)})")
-
-        df = pd.concat([viirs, modis, other], ignore_index=True)
-        df["confidence"] = df["confidence"].astype(str)
-
-        # ── Vegetation fires only ─────────────────────────────────────────────
-        if "type" in df.columns:
-            n  = len(df)
-            df = df[df["type"].isna() | (df["type"] == 0)]
-            self.logger.info(f"Type filter: {n} → {len(df)} (dropped {n - len(df)})")
-
-        # ── Deduplicate ───────────────────────────────────────────────────────
-        n  = len(df)
-        df = df.drop_duplicates(
-            subset=["latitude", "longitude", "acq_date", "acq_time", "instrument"]
+        # CONFIDENCE FILTER (keep nominal + high only) 
+        n_before = len(df)
+        df = df[df["confidence"].astype(str).str.lower().isin(["n", "h"])].copy()
+        df["confidence"] = df["confidence"].astype(str).str.lower().map(
+            {"n": 66, "h": 99}
         )
-        self.logger.info(f"Deduplication: {n} → {len(df)} (dropped {n - len(df)})")
+        self.logger.info(f"Confidence filter (n/h): {n_before} → {len(df)}")
 
-        # ── Add derived columns ───────────────────────────────────────────────
-        df["year"]       = df["acq_date"].dt.year
-        df["month"]      = df["acq_date"].dt.month
-        df["day_of_year"]= df["acq_date"].dt.dayofyear
-        df               = df.sort_values("acq_date").reset_index(drop=True)
+        # DATA TYPE CONVERSIONS 
+        df["latitude"]  = pd.to_numeric(df["latitude"],  errors="coerce")
+        df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
+        df["frp"]       = pd.to_numeric(df["frp"],       errors="coerce")
+        df = df.dropna(subset=["latitude", "longitude", "frp"])
 
-        # ── EDA summary ───────────────────────────────────────────────────────
-        self.logger.info(f"Final: {df.shape}")
-        self.logger.info(f"Date range: {df['acq_date'].min()} → {df['acq_date'].max()}")
-
-        by_year = df.groupby("year").size()
-        self.logger.info(f"Detections per year:\n{by_year.to_string()}")
-
-        fire_season_pct = 100 * df["month"].isin([7, 8, 9]).sum() / len(df)
+        # ZERO-FRP FILTER 
+        # VIIRS cannot physically produce 0 FRP — these are corrupted rows
+        n_before = len(df)
+        df = df[df["frp"] > 0].copy()
         self.logger.info(
-            f"Fire season Jul-Sep: {fire_season_pct:.1f}% "
-            f"({'Good' if fire_season_pct > 50 else 'check'})"
+            f"Zero-FRP filter: {n_before} → {len(df)} "
+            f"(removed {n_before - len(df)} corrupted rows)"
         )
 
-        # Drop metadata columns not needed for training
-        df = df.drop(columns=["version"], errors="ignore")
+        # SPATIAL BOUNDS 
+        n_before = len(df)
+        df = df[
+            (df["latitude"]  >= 18.9) & (df["latitude"]  <= 37.1) &
+            (df["longitude"] >= -8.7) & (df["longitude"] <= 12.0)
+        ].copy()
+        self.logger.info(f"Bbox filter: {n_before} → {len(df)}")
 
-        df = filter_fire_season(df, self.config, date_col="acq_date")
+        # GAS FLARE FILTER (vectorized haversine) 
+        GAS_FLARE_ZONES = [
+            {"name": "Hassi Messaoud",      "lat": 31.7, "lon": 6.1, "radius_km": 50},
+            {"name": "Hassi R'Mel",         "lat": 32.9, "lon": 3.3, "radius_km": 25},
+            {"name": "In Amenas",           "lat": 28.0, "lon": 9.5, "radius_km": 20},
+            {"name": "In Salah",            "lat": 27.2, "lon": 2.5, "radius_km": 20},
+            {"name": "Ourhoud",             "lat": 28.8, "lon": 6.9, "radius_km": 20},
+            {"name": "Rhourde Nouss",       "lat": 29.0, "lon": 7.9, "radius_km": 20},
+            {"name": "Illizi",              "lat": 26.5, "lon": 8.5, "radius_km": 25},
+            {"name": "Hassi Messaoud Nord", "lat": 32.0, "lon": 6.2, "radius_km": 30},
+            {"name": "Haoud Berkaoui",      "lat": 31.4, "lon": 5.9, "radius_km": 25},
+        ]
 
-        boundary_path = Path(self.config["gadm"]["paths"]["curated"]) / "algeria_wilayas.gpkg"
-        
-        
-        wilayas = (
-            gpd.read_file(boundary_path)[["GID_1", "NAME_1", "geometry"]]
-            .rename(columns={
-                "GID_1": "wilaya_id",
-                "NAME_1": "wilaya_name"
-            })
+        def build_flare_mask(df, zones):
+            mask = pd.Series(False, index=df.index)
+            for zone in zones:
+                dlat    = np.radians(df["latitude"]  - zone["lat"])
+                dlon    = np.radians(df["longitude"] - zone["lon"])
+                a       = (
+                    np.sin(dlat / 2) ** 2
+                    + np.cos(np.radians(zone["lat"]))
+                    * np.cos(np.radians(df["latitude"]))
+                    * np.sin(dlon / 2) ** 2
+                )
+                dist_km = 6371 * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+                mask   |= dist_km < zone["radius_km"]
+            return mask
+
+        n_before = len(df)
+        df = df[~build_flare_mask(df, GAS_FLARE_ZONES)].copy()
+        self.logger.info(
+            f"Gas flare filter: {n_before} → {len(df)} "
+            f"(removed {n_before - len(df)})"
         )
 
-        gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.longitude, df.latitude), crs="EPSG:4326")
-        gdf = gpd.sjoin(gdf, wilayas, how="left", predicate="within").drop(columns=["geometry", "index_right"])
-        df  = pd.DataFrame(gdf.drop(columns="geometry", errors="ignore"))
+        # SAHARAN LOW-FRP FILTER 
+        n_before = len(df)
+        df = df[~((df["latitude"] < 30.0) & (df["frp"] < 50))].copy()
+        self.logger.info(
+            f"Saharan low-FRP filter: {n_before} → {len(df)} "
+            f"(removed {n_before - len(df)})"
+        )
 
-        # ── Save as parquet ───────────────────────────────────────────────────
-        start_str = df["acq_date"].min().strftime("%Y%m%d")
-        end_str   = df["acq_date"].max().strftime("%Y%m%d")
-        out_path  = out_dir / f"firms_algeria_{start_str}_{end_str}.parquet"
-        df.to_parquet(out_path, index=False)
-        self.logger.info(f"Saved → {out_path}")
+        # DEDUP (safeguard against overlapping ingest runs) 
+        # Same detection can appear in multiple CSV files if date ranges overlap
+        n_before = len(df)
+        df = df.drop_duplicates(
+            subset=["acq_date", "latitude", "longitude"], keep="last"
+        )
+        if len(df) < n_before:
+            self.logger.warning(
+                f"Dropped {n_before - len(df)} duplicate detections "
+                f"(overlapping ingest date ranges)"
+            )
 
-    # ── LOAD ──────────────────────────────────────────────────────────────────
+        # SPATIAL JOIN TO COMMUNES 
+        self.logger.info("Joining fire detections to communes...")
+        communes = gpd.read_file(
+            Path(self.config["gadm"]["paths"]["curated"]) / "algeria_communes.gpkg"
+        )
+        gdf = gpd.GeoDataFrame(
+            df,
+            geometry=gpd.points_from_xy(df["longitude"], df["latitude"]),
+            crs="EPSG:4326"
+        )
+        gdf = gpd.sjoin(
+            gdf,
+            communes[["GID_1", "GID_2", "NAME_1", "NAME_2", "geometry"]],
+            how="left",
+            predicate="within"
+        )
+
+        n_before = len(gdf)
+        gdf = gdf.dropna(subset=["GID_2"]).copy()
+        gdf = gdf.drop(columns=["geometry", "index_right"])
+        self.logger.info(
+            f"Commune join: {n_before} → {len(gdf)} "
+            f"(dropped {n_before - len(gdf)} unmatched border points)"
+        )
+
+        # FINAL COLUMN SELECTION 
+        keep = [
+            "acq_date", "acq_time", "latitude", "longitude",
+            "frp", "confidence", "daynight",
+            "GID_1", "GID_2", "NAME_1", "NAME_2"
+        ]
+        keep = [c for c in keep if c in gdf.columns]
+        gdf  = gdf[keep]
+
+        # SAVE 
+        out = self.cur_dir / "firms_curated.parquet"
+        self.cur_dir.mkdir(parents=True, exist_ok=True)
+        gdf.to_parquet(out, index=False)
+
+        self.logger.info(f"Saved {len(gdf)} VIIRS detections → {out}")
+        self.logger.info(
+            f"Date range: {gdf['acq_date'].min().date()} → "
+            f"{gdf['acq_date'].max().date()}"
+        )
+        self.logger.info(f"Unique communes with fires: {gdf['GID_2'].nunique()}")
+        self.logger.info(
+            f"FRP stats: min={gdf['frp'].min():.1f}  "
+            f"max={gdf['frp'].max():.1f}  "
+            f"mean={gdf['frp'].mean():.1f}"
+        )
+
 
     def load(self):
-        """Return most recent curated FIRMS parquet."""
-        out_dir = Path(self.config["firms"]["paths"]["curated"])
-        files   = sorted(out_dir.glob("*.parquet"))
-        if not files:
+        out = self.cur_dir / "firms_curated.parquet"
+        if not out.exists():
             raise FileNotFoundError("Run curate() first")
-        df = pd.read_parquet(files[-1])
-        self.logger.info(f"Loaded {len(df)} fire detections from {files[-1].name}")
+        df = pd.read_parquet(out)
+        self.logger.info(f"Loaded {len(df)} VIIRS detections from firms_curated.parquet")
         return df
 
 
+# ── Run standalone ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import yaml
     from utils.logger import setup_logger
@@ -270,7 +330,7 @@ if __name__ == "__main__":
 
     config["paths"] = config["firms"]["paths"]
     source = FIRMSSource(config)
-    source.ingest( "2015-06-01", "2025-10-31")
+    source.ingest("2015-06-01", "2020-10-31")
 
     source.curate()
 
