@@ -87,6 +87,6 @@ logging:
 # All dynamic sources use these same bounds.
 training:
   start_date:       "2015-06-01"
-  end_date:         "2020-10-31"
+  end_date:         "2025-10-31"
   fire_season_only: true
   fire_season_months: [5, 6, 7, 8, 9, 10]   # May → October

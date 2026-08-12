@@ -143,8 +143,8 @@ class SentinelSource(DataSource):
         reduced = composite.reduceRegions(
             collection=batch_fc,
             reducer=ee.Reducer.mean(),
-            scale=20,
-            tileScale=8,
+            scale=100,
+            tileScale=4,
         )
 
         for attempt in range(1, 4):
