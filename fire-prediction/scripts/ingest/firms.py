@@ -180,6 +180,18 @@ class FIRMSSource(DataSource):
         )
         self.logger.info(f"Confidence filter (n/h): {n_before} → {len(df)}")
 
+        # TYPE FILTER — keep only presumed vegetation fires
+        n_before = len(df)
+        if "type" in df.columns:
+            df["type"] = pd.to_numeric(df["type"], errors="coerce")
+            df = df[df["type"] == 0].copy()
+            self.logger.info(
+                f"Type filter (vegetation only): {n_before} → {len(df)} "
+                f"(removed {n_before - len(df)} non-vegetation detections)"
+            )
+        else:
+            self.logger.warning("No 'type' column found — skipping type filter")
+
         # DATA TYPE CONVERSIONS 
         df["latitude"]  = pd.to_numeric(df["latitude"],  errors="coerce")
         df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
