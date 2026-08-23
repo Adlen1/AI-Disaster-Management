@@ -37,26 +37,35 @@ env/
 Thumbs.db
 
 # =====================================================
-# Raw data (never tracked)
+# data
 # =====================================================
-data/raw/**
+data/** 
 
-# Keep folder structure
-!data/raw/.gitkeep
+!data/models/.gitkeep
+
+!data/operational/raw/.gitkeep
+
+!data/operational/curated/.gitkeep
+
+!data/serving/.gitkeep
+
+!data/xai/.gitkeep
+
+!data/training/raw/.gitkeep
+
+!data/training/curated/.gitkeep
+
+!data/training/engineered/.gitkeep
+
+!data/training/integrated/.gitkeep
 
 # =====================================================
-# Curated data (generated automatically)
+# Notebooks outputs 
 # =====================================================
-data/curated/**
 
-!data/curated/.gitkeep
+notebooks/outputs
 
-# =====================================================
-# Integrated datasets (generated automatically)
-# =====================================================
-data/integrated/**
-
-!data/integrated/.gitkeep
+notebooks/catboost_info
 
 # =====================================================
 # Logs (fire-prediction specific)
