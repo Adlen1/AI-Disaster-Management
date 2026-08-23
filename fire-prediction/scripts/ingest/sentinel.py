@@ -233,11 +233,16 @@ class SentinelSource(DataSource):
             label   = f"{year}{month:02d}"
             out_csv = self.raw_dir / f"sentinel2_{label}.csv"
 
-            if out_csv.exists() and out_csv.stat().st_size > 100:
+            is_operational = "operational" in str(self.raw_dir).lower()
+            is_current_month = (year == datetime.today().year and month == datetime.today().month)
+            if out_csv.exists() and out_csv.stat().st_size > 100 and not (is_operational and is_current_month):
                 self.logger.info(f"  {label}: already exists — skipping")
                 skipped += 1
                 current += relativedelta(months=1)
                 continue
+            if out_csv.exists() and is_operational and is_current_month:
+                self.logger.info(f"  {label}: refreshing current operational month")
+                out_csv.unlink()
 
             self.logger.info(f"  {label}: building composite...")
             composite, _ = self._get_monthly_composite(year, month, region)
@@ -303,7 +308,7 @@ class SentinelSource(DataSource):
         - apply fire-season filter
         - save parquet.
         """
-        out_dir = Path(self.config["sentinel"]["paths"]["curated"])
+        out_dir = Path(self.config["paths"]["curated"])
         out_dir.mkdir(parents=True, exist_ok=True)
 
         csv_files = sorted(self.raw_dir.glob("sentinel2_*.csv"))
@@ -373,12 +378,24 @@ class SentinelSource(DataSource):
         self.logger.info(f"Saved -> {out_path}")
 
     def load(self):
-        out_dir = Path(self.config["sentinel"]["paths"]["curated"])
-        files = sorted(out_dir.glob("*.parquet"))
+        """Return the curated Sentinel parquet with the latest observation month."""
+        out_dir = Path(self.config["paths"]["curated"])
+        files = sorted(out_dir.glob("sentinel_*.parquet"))
         if not files:
             raise FileNotFoundError("Run curate() first")
-        df = pd.read_parquet(files[-1])
-        self.logger.info(f"Loaded Sentinel-2: {df.shape}")
+        candidates = []
+        for path in files:
+            try:
+                part = pd.read_parquet(path, columns=["date"])
+                latest = pd.to_datetime(part["date"], errors="coerce").max()
+                candidates.append((latest, path))
+            except Exception as exc:
+                self.logger.warning(f"Skipping unreadable curated file {path.name}: {exc}")
+        if not candidates:
+            raise RuntimeError(f"No readable curated Sentinel files in {out_dir}")
+        _, selected = max(candidates, key=lambda item: item[0])
+        df = pd.read_parquet(selected)
+        self.logger.info(f"Loaded Sentinel-2: {df.shape} from {selected.name}")
         return df
 
 

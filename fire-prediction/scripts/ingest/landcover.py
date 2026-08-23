@@ -98,8 +98,7 @@ class LandCoverSource(DataSource):
         """
         - Load commune polygons and normalize GADM's raw column names.
         """
-        boundaries_dir = Path(self.config.get("gadm", {}).get(
-            "paths", {}).get("curated", "data/curated/boundaries"))
+        boundaries_dir = Path(self.config["gadm"]["paths"]["curated"])
 
         communes_path = boundaries_dir / "algeria_communes.gpkg"
         if communes_path.exists():

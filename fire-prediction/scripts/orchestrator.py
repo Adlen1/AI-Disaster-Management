@@ -3,12 +3,10 @@ Pipeline Orchestrator
 
 Training:    python orchestrator.py --mode train
 Operational: python orchestrator.py --mode operational
-
-Static sources run only in train mode (or forced with --force-static).
-Dynamic sources run in both modes with different date windows.
 """
 
 import argparse
+import re
 import sys
 import traceback
 import yaml
@@ -28,10 +26,127 @@ from ingest.sentinel import SentinelSource
 from ingest.landcover import LandCoverSource
 
 
-def build_cfg(config: dict, key: str) -> dict:
+def build_cfg(config: dict, key: str, mode: str) -> dict:
+    """
+    Build the configuration passed to a source.
+
+    Static sources:
+        use their normal raw/curated paths.
+
+    Dynamic sources:
+        train       -> raw_training / curated_training
+        operational -> raw_operational / curated_operational
+
+    The source classes always receive:
+        paths["raw"]
+        paths["curated"]
+    """
     cfg = config.copy()
-    cfg["paths"] = config[key]["paths"]
+
+    source_config = config[key]
+    paths = source_config["paths"].copy()
+
+    if mode == "train":
+        if "raw_training" in paths:
+            paths["raw"] = paths.pop("raw_training")
+        if "curated_training" in paths:
+            paths["curated"] = paths.pop("curated_training")
+
+    elif mode == "operational":
+        if "raw_operational" in paths:
+            paths["raw"] = paths.pop("raw_operational")
+        if "curated_operational" in paths:
+            paths["curated"] = paths.pop("curated_operational")
+
+    else:
+        raise ValueError(f"Unsupported pipeline mode: {mode}")
+
+    # Every source must ultimately receive generic raw/curated paths.
+    if "raw" not in paths:
+        raise KeyError(
+            f"{key}: no raw path configured for mode '{mode}'"
+        )
+
+    if "curated" not in paths:
+        raise KeyError(
+            f"{key}: no curated path configured for mode '{mode}'"
+        )
+
+    cfg["paths"] = paths
+
+    # FIRMS uses different sensors for historical and operational data.
+    if key == "firms":
+        if mode == "train":
+            cfg["sensors"] = config["firms"]["sensors"]
+        else:
+            cfg["sensors"] = config["firms"]["sensors_nrt"]
+
     return cfg
+
+
+def choose_firms_operational_window(config: dict, today: datetime, fire_months):
+    """
+    - Use a 7-day refresh if all sensors have continuous coverage; otherwise backfill the full season.
+    """
+    season_start = today.replace(month=min(fire_months), day=1).date()
+    path_config = config["firms"]["paths"]
+    raw_value = path_config.get("raw_operational", path_config.get("raw"))
+    raw_dir = Path(raw_value)
+    sensors = {str(sensor).upper() for sensor in config["firms"].get("sensors_nrt", [])}
+    pattern = re.compile(
+        r"^firms_(?P<sensor>.+)_(?P<start>\d{4}-\d{2}-\d{2})_"
+        r"(?P<end>\d{4}-\d{2}-\d{2})\.csv$"
+    )
+
+    intervals_by_sensor = {sensor: [] for sensor in sensors}
+    for path in raw_dir.glob("firms_*.csv"):
+        match = pattern.match(path.name)
+        if not match:
+            continue
+        sensor = match.group("sensor").upper()
+        if sensor not in intervals_by_sensor:
+            continue
+        try:
+            start_date = datetime.strptime(match.group("start"), "%Y-%m-%d").date()
+            end_date = datetime.strptime(match.group("end"), "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        intervals_by_sensor[sensor].append((start_date, end_date))
+
+    required_end = today.date() - timedelta(days=1)
+    continuous = True
+    coverage_notes = []
+    for sensor in sensors:
+        intervals = sorted(intervals_by_sensor[sensor])
+        cursor = season_start
+        if not intervals:
+            continuous = False
+            coverage_notes.append(f"{sensor}: no retained raw files")
+            continue
+        for interval_start, interval_end in intervals:
+            if interval_end < season_start:
+                continue
+            interval_start = max(interval_start, season_start)
+            if interval_start > cursor:
+                continuous = False
+                coverage_notes.append(f"{sensor}: gap {cursor} → {interval_start - timedelta(days=1)}")
+                break
+            cursor = max(cursor, interval_end + timedelta(days=1))
+            if cursor > required_end:
+                break
+        if cursor <= required_end:
+            continuous = False
+            coverage_notes.append(f"{sensor}: coverage ends {cursor - timedelta(days=1)}")
+
+    if continuous and sensors:
+        start = today.date() - timedelta(days=7)
+        reason = "recent overlap refresh"
+    else:
+        start = season_start
+        reason = "initial/current-season backfill"
+        if coverage_notes:
+            print("FIRMS archive incomplete; using full current-season backfill: " + "; ".join(coverage_notes))
+    return start.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d"), reason
 
 
 def preflight_check(config: dict, mode: str):
@@ -101,16 +216,34 @@ def run_pipeline(mode: str, force_static: bool = False):
         start_date = config["training"]["start_date"]
         end_date   = config["training"]["end_date"]
     else:
-        # Operational — per-source lag to account for data availability delays
-        # ERA5 preliminary (ERA5T) lags ~5 days
-        # Sentinel-2 revisit + processing ~5 days
-        # FIRMS NRT available within ~3 hours
+        # Operational — per-source lag and window configurations
         today = datetime.today()
-        firms_start = firms_end = today.strftime("%Y-%m-%d")
+        
+        fire_months = config["training"].get("fire_season_months", list(range(1, 13)))
+        in_fire_season = today.month in fire_months
 
-        era5_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
-        era5_start = era5_end = era5_date
+        # FIRMS needs the current-season archive for days_since_fire
+        if in_fire_season:
+            firms_start, firms_end, firms_window_reason = choose_firms_operational_window(
+                config, today, fire_months
+            )
+        else:
+            firms_start = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+            firms_end = today.strftime("%Y-%m-%d")
+            firms_window_reason = "outside fire-season bounded refresh"
 
+        # ERA5-Land: use the latest available date (approximately seven days
+        # behind today). The current-season range is needed for recursive FWI
+        # state and for the seven-day weather features.
+        era5_end_dt = today - timedelta(days=config.get("operational", {}).get("era5_lag_days", 7))
+        if in_fire_season:
+            era5_start_dt = era5_end_dt.replace(month=min(fire_months), day=1)
+        else:
+            era5_start_dt = era5_end_dt - timedelta(days=7)
+        era5_end = era5_end_dt.strftime("%Y-%m-%d")
+        era5_start = era5_start_dt.strftime("%Y-%m-%d")
+
+        # Sentinel-2: Fetch from start of the month to capture latest cloud-free satellite composite
         sentinel_start = today.replace(day=1).strftime("%Y-%m-%d")
         sentinel_end = today.strftime("%Y-%m-%d")
 
@@ -122,7 +255,7 @@ def run_pipeline(mode: str, force_static: bool = False):
             months = config["training"]["fire_season_months"]
             print(f"  Fire season only: {months}")
     else:
-        print(f"  FIRMS:    {firms_start} (NRT)")
+        print(f"  FIRMS:    {firms_start} → {firms_end} (NRT; {firms_window_reason})")
         
         print(f"  ERA5-Land: {era5_start} → {era5_end} (ERA5T 9km)")
         
@@ -135,75 +268,79 @@ def run_pipeline(mode: str, force_static: bool = False):
     results = {}
 
     # Static sources — training/setup only 
-    # Never re-run in operational mode — they never change day-to-day
+    # Never re-run in operational mode 
     if mode == "train" or force_static:
         print("\nSTATIC SOURCES (run once)")
 
         # GADM must succeed — everything else depends on it
-        gadm = GADMSource(build_cfg(config, "gadm"))
+        gadm = GADMSource(build_cfg(config, "gadm", mode))
         ok = run_source("GADM Boundaries", gadm)
         if not ok:
             print("\nGADM failed — all other sources depend on it. Stopping.")
             sys.exit(1)
 
-        results["dem"]      = run_source("DEM",      DEMSource(build_cfg(config, "dem")))
-        results["worldpop"] = run_source("WorldPop", WorldPopSource(build_cfg(config, "worldpop")))
-        results["osm"]      = run_source("OSM Roads",OSMSource(build_cfg(config, "osm")))
+        results["dem"] = run_source(
+            "DEM",
+            DEMSource(build_cfg(config, "dem", mode))
+        )
 
-        
-        results["landcover"] = run_source("Land Cover",LandCoverSource(build_cfg(config, "landcover")))  
+        results["worldpop"] = run_source(
+            "WorldPop",
+            WorldPopSource(build_cfg(config, "worldpop", mode))
+        )
 
+        results["osm"] = run_source(
+            "OSM Roads",
+            OSMSource(build_cfg(config, "osm", mode))
+        )
+
+        results["landcover"] = run_source(
+            "Land Cover",
+            LandCoverSource(build_cfg(config, "landcover", mode))
+        )
     # Dynamic sources 
     print("\nDYNAMIC SOURCES")
 
     if mode == "train":
-        #Training — all use _SP (standard processing, science quality)
-        #FIRMS: curate() reads pre-downloaded historical CSVs
         results["firms"] = run_source(
             "FIRMS (historical)",
-            FIRMSSource(build_cfg(config, "firms")),
+            FIRMSSource(build_cfg(config, "firms", mode)),
             start_date=start_date,
             end_date=end_date
         )
+
         results["era5"] = run_source(
             "ERA5",
-            ERA5Source(build_cfg(config, "era5")),
+            ERA5Source(build_cfg(config, "era5", mode)),
             start_date=start_date,
             end_date=end_date
         )
+
         results["sentinel"] = run_source(
             "Sentinel-2",
-            SentinelSource(build_cfg(config, "sentinel")),
+            SentinelSource(build_cfg(config, "sentinel", mode)),
             start_date=start_date,
             end_date=end_date
         )
 
     else:
-        # Operational — FIRMS uses NRT sensors (available within ~3h)
-        # ERA5 and Sentinel use recent window with appropriate lag
-        op_config = config.copy()
-        op_config["firms"] = config["firms"].copy()
-        op_config["firms"]["sensors"] = [
-            "VIIRS_SNPP_NRT",
-            "VIIRS_NOAA20_NRT",
-            "VIIRS_NOAA21_NRT",
-        ]
-
         results["firms"] = run_source(
             "FIRMS (NRT)",
-            FIRMSSource({**build_cfg(op_config, "firms")}),
+            FIRMSSource(build_cfg(config, "firms", mode)),
             start_date=firms_start,
             end_date=firms_end
         )
+
         results["era5"] = run_source(
             "ERA5 (ERA5T)",
-            ERA5Source(build_cfg(config, "era5")),
+            ERA5Source(build_cfg(config, "era5", mode)),
             start_date=era5_start,
             end_date=era5_end
         )
+
         results["sentinel"] = run_source(
             "Sentinel-2",
-            SentinelSource(build_cfg(config, "sentinel")),
+            SentinelSource(build_cfg(config, "sentinel", mode)),
             start_date=sentinel_start,
             end_date=sentinel_end
         )

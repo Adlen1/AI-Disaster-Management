@@ -1,20 +1,15 @@
-# Central config — all paths, parameters, API keys loaded from here
-
 paths:
-  raw_root:     data/raw
-  curated_root: data/curated
-  integrated:   data/integrated
-  logs:         logs/
-
-algeria:
-  bbox:         [-8.67, 18.96, 11.99, 37.09]   # [west, south, east, north]
-  crs:          "EPSG:4326"
-  grid_resolution_m: 1000                          # spatial grid cell size
+  training_root:     data/training
+  operational_root:  data/operational
+  models:            data/models
+  serving:           data/serving
+  xai:               data/xai
+  logs:              logs/
 
 gadm:
   paths:
-    raw:     data/raw/boundaries
-    curated: data/curated/boundaries
+    raw:     data/training/raw/boundaries
+    curated: data/training/curated/boundaries
   filename_gpkg: "gadm41_DZA.gpkg"
   admin_levels:
     - 0   # country
@@ -23,70 +18,77 @@ gadm:
 
 dem:
   paths:
-    raw:     data/raw/dem
-    curated: data/curated/dem
+    raw:     data/training/raw/dem
+    curated: data/training/curated/dem
   filename: "algeria_dem.tif"
 
 worldpop:
   paths:
-    raw:     data/raw/worldpop
-    curated: data/curated/worldpop
+    raw:     data/training/raw/worldpop
+    curated: data/training/curated/worldpop
   filename: "dza_pd_2020_1km_UNadj.tif"
 
 osm:
   paths:
-    raw:     data/raw/roads
-    curated: data/curated/roads
+    raw:     data/training/raw/roads
+    curated: data/training/curated/roads
   filename: "algeria-260706.osm.pbf"
 
 landcover:
   paths:
-    raw:     data/raw/landcover
-    curated: data/curated/landcover
-  source: "ESA WorldCover 2021"
-  resolution_m: 10
-  year: 2021
+    raw:     data/training/raw/landcover
+    curated: data/training/curated/landcover
 
 era5:
   paths:
-    raw:     data/raw/era5
-    curated: data/curated/era5
-  variables:
-    - "2m_temperature"
-    - "2m_dewpoint_temperature"
-    - "10m_u_component_of_wind"
-    - "10m_v_component_of_wind"
-    - "total_precipitation"
-    - "volumetric_soil_water_layer_1"
-  pressure_levels: null    # surface only
+    raw_training:         data/training/raw/era5
+    curated_training:     data/training/curated/era5
+    raw_operational:      data/operational/raw/era5
+    curated_operational:  data/operational/curated/era5
 
 sentinel:
   gee_project: "ai-disaster-management-502014"
   paths:
-    raw: "data/raw/sentinel"
-    curated: "data/curated/sentinel"
+    raw_training:         data/training/raw/sentinel
+    curated_training:     data/training/curated/sentinel
+    raw_operational:      data/operational/raw/sentinel
+    curated_operational:  data/operational/curated/sentinel
 
 firms:
   paths:
-    raw:     data/raw/firms
-    curated: data/curated/firms
+    raw_training:         data/training/raw/firms
+    curated_training:     data/training/curated/firms
+    raw_operational:      data/operational/raw/firms
+    curated_operational:  data/operational/curated/firms
   sensors:
     - VIIRS_SNPP_SP
     - VIIRS_NOAA20_SP
-    - VIIRS_NOAA21_SP
-  map_key:  null    # set via environment variable FIRMS_MAP_KEY
+  sensors_nrt:
+    - VIIRS_SNPP_NRT
+    - VIIRS_NOAA20_NRT
+    - VIIRS_NOAA21_NRT
+
 
 logging:
-  level:    "INFO"
-  file:     "logs/pipeline.log"
+  level: "INFO"
+  file:  "logs/pipeline.log"
 
-
-# ── Training window ────────────────────────────────────────────────────────
-# Sentinel-2 defines the earliest date (June 2015).
-# Fire season: May-October for Algeria.
-# All dynamic sources use these same bounds.
 training:
-  start_date:       "2015-06-01"
-  end_date:         "2025-10-31"
-  fire_season_only: true
-  fire_season_months: [5, 6, 7, 8, 9, 10]   # May → October
+  start_date: "2015-01-01"
+  end_date:   "2025-12-31"
+  fire_season_only:   true
+  fire_season_months: [5, 6, 7, 8, 9, 10]
+  integrated:         data/training/integrated
+  engineered:         data/training/engineered
+
+operational:
+  era5_lag_days:     7
+  firms_lag_hours:   3
+  sentinel_lag_days: 5
+  schedule_hour:     5
+  schedule_minute:   0
+
+algeria:
+  bbox:              [-8.67, 18.96, 11.99, 37.09]
+  crs:               "EPSG:4326"
+  grid_resolution_m: 1000

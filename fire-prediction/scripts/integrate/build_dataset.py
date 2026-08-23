@@ -1,35 +1,28 @@
-# scripts/integrate/build_dataset.py
 """
-Integration — builds the unified training dataset.
+Integration — builds the unified wildfire training dataset.
 
-Unit of analysis: commune × day (fire season only, fire-prone communes only)
+Unit of analysis: commune × day (fire season, fire-prone communes only)
 
-Design decisions:
-  - Only fire-prone communes (~400-600) are included — Saharan communes excluded
-    via ESA WorldCover forest/shrubland coverage + historical FIRMS fire count.
-  - Stratified skeleton: ALL positive days (next-day fire) + 4× sampled
-    negative days → ~20% positive rate, learnable without resampling tricks.
-  - Target: next_day_risk_class (0=LOW, 1=MODERATE, 2=HIGH) — prediction,
-    not detection. Labels are derived from next-day FIRMS activity.
-  - Same-day fire_count/frp kept as features (current fire state is a
-    valid predictor of tomorrow's fire, not leakage).
+Design:
+  - Full dense calendar is built first for all commune × fire-season days.
+  - Modeling skeleton keeps all positive next-day fire days + 4× sampled negatives.
+  - Target: next_day_risk_class (0=LOW, 1=MODERATE, 2=HIGH).
+  - Same-day fire activity is retained as a valid predictor of next-day risk.
+  - Dense calendar is saved separately for rolling, lag, anomaly, and baseline
+    feature engineering before features are added to the modeling dataset.
 
 Join strategy:
-  FIRMS      → spatially joined to communes in firms.py, aggregated here
-               to commune × day. Positives/negatives determined from
-               next-day aggregates.
-  ERA5       → nearest ERA5 cell to each commune centroid (BallTree).
-               Many small communes share one cell — expected, kept visible.
-  Sentinel-2 → joined on (commune_id, year, month) — monthly resolution
-               is correct since vegetation state changes slowly.
-  DEM        → zonal mean per commune (static, cached after first run).
-  WorldPop   → zonal mean per commune (static, cached after first run).
-  OSM roads  → zonal mean per commune (static, cached after first run).
+  FIRMS      → commune × day fire aggregates.
+  ERA5       → nearest ERA5 cell to each commune centroid.
+  Sentinel-2 → monthly commune-level vegetation indices.
+  DEM/WorldPop/OSM → static commune-level zonal features.
+  Land cover → commune-level WorldCover fractions.
 
-Output:
-  data/integrated/algeria_wildfire_dataset.parquet
-  data/integrated/commune_static_features.parquet  <- cached static features
-  data/integrated/algeria_wildfire_dataset_sample100.csv
+Outputs:
+  data/training/integrated/algeria_wildfire_dataset.parquet
+  data/training/integrated/algeria_wildfire_dense_calendar.parquet
+  data/training/integrated/commune_static_features.parquet
+  data/training/integrated/algeria_wildfire_dataset_sample100.csv
 """
 
 import sys
@@ -43,37 +36,41 @@ from utils.logger import setup_logger
 
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
+import yaml
 
-CURATED = Path("data/curated")
-OUT_DIR = Path("data/integrated")
+with open("configs/config.yaml") as f:
+    CONFIG = yaml.safe_load(f)
+
+CURATED = Path(CONFIG["gadm"]["paths"]["curated"]).parent   # data/training/curated
+OUT_DIR = Path(CONFIG["training"]["integrated"])
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-BOUNDARIES_DIR = CURATED / "boundaries"
-DEM_DIR        = CURATED / "dem"
-WORLDPOP_DIR   = CURATED / "worldpop"
-ROADS_DIR      = CURATED / "roads"
-ERA5_DIR       = CURATED / "era5"
-SENTINEL_DIR   = CURATED / "sentinel"
-FIRMS_DIR      = CURATED / "firms"
-LANDCOVER_DIR  = CURATED / "landcover"
+BOUNDARIES_DIR = Path(CONFIG["gadm"]["paths"]["curated"])
+DEM_DIR        = Path(CONFIG["dem"]["paths"]["curated"])
+WORLDPOP_DIR   = Path(CONFIG["worldpop"]["paths"]["curated"])
+ROADS_DIR      = Path(CONFIG["osm"]["paths"]["curated"])
+ERA5_DIR       = Path(CONFIG["era5"]["paths"]["curated_training"])
+SENTINEL_DIR   = Path(CONFIG["sentinel"]["paths"]["curated_training"])
+FIRMS_DIR      = Path(CONFIG["firms"]["paths"]["curated_training"])
+LANDCOVER_DIR  = Path(CONFIG["landcover"]["paths"]["curated"])
 
 # Commune mask thresholds
 MIN_FOREST_PCT       = 0.10  # % ESA WorldCover forest/shrubland to keep commune
 MIN_HISTORICAL_FIRES = 1     # min FIRMS detections 2012-2024 to keep commune
 SAHARAN_WILAYAS = [
     "DZA.1_1",   # Adrar
-    "DZA.41_1",  # Tamanrasset  ← was DZA.4_1 (that's Alger!) 
-    "DZA.22_1",  # Illizi       ← was DZA.11_1 (that's Bordj Bou Arréridj!)
-    "DZA.31_1",  # Naâma        ← was DZA.26_1 (that's M'Sila)
-    "DZA.17_1",  # El Bayadh    ← was DZA.32_1 (that's Oran!)
-    "DZA.44_1",  # Tindouf      ← was DZA.33_1 (that's Ouargla)
-    "DZA.33_1",  # Ouargla      ← was DZA.39_1 (that's Skikda!)
-    "DZA.20_1",  # Ghardaïa     ← was DZA.44_1 (that's Tindouf... accidentally correct)
-    "DZA.7_1",   # Béchar       ← was DZA.47_1 (that's Tizi Ouzou!)
-    "DZA.9_1",   # Biskra        ← add, partially Saharan
-    "DZA.16_1",  # Djelfa        ← add, partially Saharan (steppe)
-    "DZA.25_1",  # Laghouat      ← add, partially Saharan
-    "DZA.18_1",  # El Oued       ← add, pure Sahara
+    "DZA.41_1",  # Tamanrasset  
+    "DZA.22_1",  # Illizi     
+    "DZA.31_1",  # Naâma        
+    "DZA.17_1",  # El Bayadh    
+    "DZA.44_1",  # Tindouf    
+    "DZA.33_1",  # Ouargla     
+    "DZA.20_1",  # Ghardaïa    
+    "DZA.7_1",   # Béchar       
+    "DZA.9_1",   # Biskra        
+    "DZA.16_1",  # Djelfa        
+    "DZA.25_1",  # Laghouat      
+    "DZA.18_1",  # El Oued       
 ]
 
 # Stratified sampling ratio (negatives per positive)
@@ -249,7 +246,16 @@ def build_stratified_skeleton(communes: gpd.GeoDataFrame,
                                start: str,
                                end: str,
                                fire_months: list,
-                               neg_ratio: int = NEG_RATIO) -> pd.DataFrame:
+                               neg_ratio: int = NEG_RATIO):
+    """
+    Returns (skeleton, full).
+
+    `full` is the complete, unsampled calendar and must be used for all
+    time-based feature engineering.
+
+    `skeleton` is the target-conditioned sampled dataset and must not be used
+    for rolling, lag, or baseline calculations.
+    """
     print(f"\n{'='*55}")
     print(f"STRATIFIED SKELETON")
     print(f"{'='*55}")
@@ -268,8 +274,9 @@ def build_stratified_skeleton(communes: gpd.GeoDataFrame,
     full["frp_max"]    = full["frp_max"].fillna(0.0)
 
     # ── NEXT-DAY TARGET — group by (commune_id, season_year) ─────────────
-    # Prevents Oct 31 grabbing May 1 next year as "tomorrow" across the
-    # off-season gap when only fire-season months are in all_dates.
+    # Keeps the next-day target within the same fire season and prevents
+    # crossing the off-season gap (e.g. Oct 31 → May 1).
+    # season_year is kept so all temporal features use the same grouping.
     full["season_year"] = full["date"].dt.year
     full = full.sort_values(["commune_id", "season_year", "date"])
 
@@ -284,9 +291,6 @@ def build_stratified_skeleton(communes: gpd.GeoDataFrame,
     full = full.dropna(subset=["next_day_fire_count"]).copy()
     full["next_day_fire_count"] = full["next_day_fire_count"].astype(int)
     full["next_day_frp_sum"]    = full["next_day_frp_sum"].fillna(0.0)
-
-    # Drop season_year — served its purpose, redundant with year column later
-    full = full.drop(columns=["season_year"])
 
     full["next_day_risk_class"] = assign_risk_class(
         full["next_day_fire_count"], full["next_day_frp_sum"]
@@ -316,26 +320,18 @@ def build_stratified_skeleton(communes: gpd.GeoDataFrame,
     print(f"  2 HIGH:     {n_high:>8,} ({100*n_high/total:.1f}%)")
     print(f"  Positive rate: {100*(n_mod+n_high)/total:.1f}%")
 
-    return skeleton
+    return skeleton, full
 
 
 # ── STEP 3: JOIN ERA5 WEATHER ─────────────────────────────────────────────────
 
-def join_era5(df: pd.DataFrame,
-              era5_path: Path,
-              communes: gpd.GeoDataFrame) -> pd.DataFrame:
+def map_communes_to_era5(communes: gpd.GeoDataFrame, era5: pd.DataFrame) -> pd.DataFrame:
     """
-    Join ERA5-Land weather to each commune x day row via nearest cell (BallTree).
-    Many small communes map to the same ERA5 cell — expected at 9km resolution.
+    Maps each commune to its nearest ERA5 cell using a BallTree.
+    Shared by both the modeling skeleton and dense calendar to ensure
+    consistent ERA5 assignments.
     """
     from sklearn.neighbors import BallTree
-
-    print(f"\n{'='*55}")
-    print(f"ERA5 JOIN")
-    print(f"{'='*55}")
-
-    era5 = pd.read_parquet(era5_path)
-    era5["date"] = pd.to_datetime(era5["date"])
 
     centroids = communes.to_crs("EPSG:32631").copy()
     centroids["geometry"] = centroids.geometry.centroid
@@ -365,6 +361,22 @@ def join_era5(df: pd.DataFrame,
     n_per_cell = commune_to_era5.groupby("era5_cell_id")["commune_id"].nunique()
     print(f"ERA5 cell sharing: median {n_per_cell.median():.0f} communes/cell, "
           f"max {n_per_cell.max()} sharing one cell")
+    return commune_to_era5
+
+
+def join_era5(df: pd.DataFrame,era5_path: Path,communes: gpd.GeoDataFrame) -> pd.DataFrame:
+    """
+    Join ERA5-Land weather to each commune x day row via nearest cell (BallTree).
+    Many small communes map to the same ERA5 cell — expected at 9km resolution.
+    """
+    print(f"\n{'='*55}")
+    print(f"ERA5 JOIN")
+    print(f"{'='*55}")
+
+    era5 = pd.read_parquet(era5_path)
+    era5["date"] = pd.to_datetime(era5["date"])
+
+    commune_to_era5 = map_communes_to_era5(communes, era5)
 
     df["commune_id"] = df["commune_id"].astype(str)
     df = df.merge(commune_to_era5, on="commune_id", how="left")
@@ -381,6 +393,59 @@ def join_era5(df: pd.DataFrame,
     print(f"ERA5 join complete: {missing:,} rows missing weather "
           f"({100*missing/len(df):.2f}%)")
     return df
+
+
+def build_dense_calendar(full: pd.DataFrame,
+                          era5_path: Path,
+                          communes: gpd.GeoDataFrame) -> pd.DataFrame:
+    """
+    Builds the dense calendar used for temporal feature engineering.
+
+    `full` contains every commune × fire-season day. This function adds daily
+    weather and the same-day wilaya fire sum using all fire-prone communes.
+
+    The dense calendar is used for rolling, lag, days-since-fire, anomaly, and
+    baseline features; those features are computed later in the notebook.
+    """
+    print(f"\n{'='*55}")
+    print(f"DENSE CALENDAR (for rolling / lag / baseline features)")
+    print(f"{'='*55}")
+
+    era5 = pd.read_parquet(era5_path)
+    era5["date"] = pd.to_datetime(era5["date"])
+    commune_to_era5 = map_communes_to_era5(communes, era5)
+
+    dense = full[[
+        "date", "commune_id", "season_year",
+        "fire_count", "frp_sum", "next_day_risk_class",
+    ]].copy()
+
+    # Wilaya id needed for the same-day neighbor-fire feature
+    commune_meta = communes[["commune_id", "wilaya_id"]].copy()
+    commune_meta["commune_id"] = commune_meta["commune_id"].astype(str)
+    dense["commune_id"] = dense["commune_id"].astype(str)
+    dense = dense.merge(commune_meta, on="commune_id", how="left")
+
+    # Same-day wilaya-wide fire sum over ALL fire-prone communes (dense) 
+    wilaya_sum = (
+        dense.groupby(["wilaya_id", "date"])["fire_count"]
+        .sum().reset_index().rename(columns={"fire_count": "wilaya_fire_sum"})
+    )
+    dense = dense.merge(wilaya_sum, on=["wilaya_id", "date"], how="left")
+
+    # Daily weather needed for rolling FWI/DC/DMC/precip and the FFMC baseline
+    dense = dense.merge(commune_to_era5, on="commune_id", how="left")
+    weather_cols = ["FWI", "DC", "DMC", "precip_mm", "FFMC"]
+    dense = dense.merge(
+        era5[["date", "era5_cell_id"] + weather_cols],
+        on=["date", "era5_cell_id"], how="left"
+    )
+
+    missing = dense["FWI"].isna().sum()
+    print(f"Dense calendar built: {len(dense):,} rows "
+          f"({dense['commune_id'].nunique()} communes), "
+          f"{missing:,} rows missing weather ({100*missing/len(dense):.2f}%)")
+    return dense
 
 
 # ── STEP 4: JOIN SENTINEL-2 VEGETATION INDICES ────────────────────────────────
@@ -628,15 +693,11 @@ def finalize(df: pd.DataFrame) -> pd.DataFrame:
 # ── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
-    import yaml
     logger = setup_logger()
 
-    with open("configs/config.yaml") as f:
-        config = yaml.safe_load(f)
-
-    fire_months = config["training"]["fire_season_months"]
-    start_date  = config["training"]["start_date"]
-    end_date    = config["training"]["end_date"]
+    fire_months = CONFIG["training"]["fire_season_months"]
+    start_date  = CONFIG["training"]["start_date"]
+    end_date    = CONFIG["training"]["end_date"]
 
     print(f"\n{'='*55}")
     print(f"  Integration — building unified training dataset")
@@ -675,7 +736,7 @@ def main():
     print(f"  Sentinel: {sentinel_path.name if sentinel_path else 'NOT FOUND — skipping'}")
 
     # Step 0: Filter to fire-prone communes
-    communes = load_fire_prone_communes(communes, firms_path, config)
+    communes = load_fire_prone_communes(communes, firms_path, CONFIG)
 
     # Step 1: Aggregate FIRMS to commune x day
     firms_agg = aggregate_firms(firms_path)
@@ -684,11 +745,17 @@ def main():
     fire_prone_ids = set(communes["commune_id"].astype(str).values)
     firms_agg = firms_agg[firms_agg["commune_id"].isin(fire_prone_ids)].copy()
 
-    # Step 2: Build stratified skeleton
-    df = build_stratified_skeleton(
+    # Step 2: Build stratified skeleton (+ dense calendar for rolling features)
+    df, full_grid = build_stratified_skeleton(
         communes, firms_agg, start_date, end_date,
         fire_months, neg_ratio=NEG_RATIO
     )
+
+    dense_calendar = build_dense_calendar(full_grid, era5_path, communes)
+    dense_path = OUT_DIR / "algeria_wildfire_dense_calendar.parquet"
+    dense_calendar.to_parquet(dense_path, index=False)
+    print(f"\nSaved dense calendar -> {dense_path}")
+    print(f"   {dense_calendar.shape[0]:,} rows x {dense_calendar.shape[1]} columns")
 
     # Step 3: Join commune metadata
     commune_meta = communes[

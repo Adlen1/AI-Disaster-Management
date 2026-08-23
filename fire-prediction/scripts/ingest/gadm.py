@@ -13,6 +13,7 @@ from loguru import logger
 import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from utils.base import DataSource
+import pandas as pd
 
 
 class GADMSource(DataSource):

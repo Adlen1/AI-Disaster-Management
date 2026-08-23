@@ -392,6 +392,21 @@ class ERA5Source(DataSource):
 
         start = datetime.strptime(start_date, "%Y-%m-%d")
         end = datetime.strptime(end_date, "%Y-%m-%d")
+
+        # Operational FWI is recursive: FFMC/DMC/DC require the current
+        # fire-season history, not only the last seven days. On the first
+        # operational run, expand the requested window back to the beginning
+        # of the current fire season. Existing closed monthly files are still
+        # skipped below, so subsequent runs only refresh the current month.
+        if "operational" in str(self.raw_dir).lower():
+            fire_months = self.config.get("training", {}).get(
+                "fire_season_months", list(range(1, 13))
+            )
+            if fire_months and start.month in fire_months:
+                season_start = datetime(start.year, min(fire_months), 1)
+                start = min(start, season_start)
+                start_date = start.strftime("%Y-%m-%d")
+
         bbox = self.config["algeria"]["bbox"]
 
         try:
@@ -421,13 +436,24 @@ class ERA5Source(DataSource):
 
             out_file = self.raw_dir / f"era5_{year_str}{month_str}.nc"
 
-            if out_file.exists() and not zipfile.is_zipfile(out_file):
-                self.logger.info(f"Already exists — skipping {out_file.name}")
+            today = datetime.today()
+            is_current_month = (current.year == today.year and current.month == today.month)
+
+            if out_file.exists() and not zipfile.is_zipfile(out_file) and not is_current_month:
+                self.logger.info(f"Already exists (closed month) — skipping {out_file.name}")
                 current += relativedelta(months=1)
                 continue
+            elif out_file.exists() and is_current_month:
+                self.logger.info(f"Current month {out_file.name} — re-downloading to include latest days")
+                out_file.unlink()  # delete stale file before re-download
 
             next_month = current + relativedelta(months=1)
-            last_day = (next_month - timedelta(days=1)).day
+            month_last_day = (next_month - timedelta(days=1)).day
+         
+            if current.year == end.year and current.month == end.month:
+                last_day = min(month_last_day, end.day)
+            else:
+                last_day = month_last_day
             days = [f"{d:02d}" for d in range(1, last_day + 1)]
             all_hours = [f"{h:02d}:00" for h in range(24)]
 
@@ -522,7 +548,7 @@ class ERA5Source(DataSource):
         - FWI is computed per year — the RESET_GAP_DAYS mechanism correctly handles
         the off-season gap at year boundaries.
         """
-        out_dir = Path(self.config["era5"]["paths"]["curated"])
+        out_dir = Path(self.config["paths"]["curated"])
         boundary_path = Path(self.config["gadm"]["paths"]["curated"]) / "algeria_country.gpkg"
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -571,10 +597,16 @@ class ERA5Source(DataSource):
             year_files = sorted(files_by_year[year])
             year_cache = out_dir / f"era5_year_{year}.parquet"
 
-            if year_cache.exists():
-                self.logger.info(f"Year {year}: already processed — loading cache")
+            today = datetime.today()
+            is_current_year = (year == today.year)
+
+            if year_cache.exists() and not is_current_year:
+                self.logger.info(f"Year {year}: already processed (closed year) — loading cache")
                 year_parquets.append(year_cache)
                 continue
+            elif year_cache.exists() and is_current_year:
+                self.logger.info(f"Year {year}: current year — reprocessing with latest data")
+                year_cache.unlink()
 
             self.logger.info(f"\n── Year {year}: processing {len(year_files)} monthly files ──")
             year_months = []
@@ -741,13 +773,24 @@ class ERA5Source(DataSource):
             self.logger.info(f"Removed year cache: {p.name}")
 
     def load(self):
-        """Return most recent curated ERA5 parquet."""
-        out_dir = Path(self.config["era5"]["paths"]["curated"])
-        files = sorted(out_dir.glob("*.parquet"))
+        """Return the curated ERA5 parquet with the latest actual date."""
+        out_dir = Path(self.config["paths"]["curated"])
+        files = sorted(out_dir.glob("era5_*.parquet"))
         if not files:
             raise FileNotFoundError("Run curate() first")
-        df = pd.read_parquet(files[-1])
-        self.logger.info(f"Loaded ERA5: {df.shape}")
+        candidates = []
+        for path in files:
+            try:
+                part = pd.read_parquet(path, columns=["date"])
+                latest = pd.to_datetime(part["date"], errors="coerce").max()
+                candidates.append((latest, path))
+            except Exception as exc:
+                self.logger.warning(f"Skipping unreadable curated file {path.name}: {exc}")
+        if not candidates:
+            raise RuntimeError(f"No readable curated ERA5 files in {out_dir}")
+        _, selected = max(candidates, key=lambda item: item[0])
+        df = pd.read_parquet(selected)
+        self.logger.info(f"Loaded ERA5: {df.shape} from {selected.name}")
         return df
 
 # ── Run standalone ────────────────────────────────────────────────────────────

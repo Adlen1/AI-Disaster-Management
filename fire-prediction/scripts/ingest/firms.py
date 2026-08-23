@@ -6,6 +6,7 @@ Output files:
 """
 
 import os
+import re
 import time
 import numpy as np
 import pandas as pd
@@ -33,12 +34,42 @@ FIRMS_KEEP_COLS = [
 class FIRMSSource(DataSource):
 
     BASE_URL      = "https://firms.modaps.eosdis.nasa.gov/api/area/csv"
-    MAX_DAYS_ARCH = 5   # max days per API call for archive sensors (_SP)
+    MAX_DAYS_ARCH = 5   # max days per API call for FIRMS Area API
+    RAW_FILE_RE = re.compile(
+        r"^firms_(?P<sensor>.+)_(?P<start>\d{4}-\d{2}-\d{2})_"
+r"(?P<end>\d{4}-\d{2}-\d{2})\.csv$"
+    )
+
+    def _existing_intervals(self, sensor: str):
+        """Return valid, non-empty raw-file intervals for one sensor."""
+        intervals = []
+        sensor_key = sensor.upper()
+        for path in self.raw_dir.glob("firms_*.csv"):
+            if path.stat().st_size <= 100:
+                continue
+            match = self.RAW_FILE_RE.match(path.name)
+            if not match or match.group("sensor").upper() != sensor_key:
+                continue
+            try:
+                start = datetime.strptime(match.group("start"), "%Y-%m-%d").date()
+                end = datetime.strptime(match.group("end"), "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if start <= end:
+                intervals.append((start, end, path.name))
+        return sorted(intervals)
+
+    @staticmethod
+    def _covered(day, intervals):
+        """Whether at least one retained raw file claims coverage for day."""
+        return any(start <= day <= end for start, end, _ in intervals)
 
     def ingest(self, start_date: str = None, end_date: str = None):
-        """
-        - Download FIRMS data for Algeria via API.
-        - Skip this if data already in raw/firms/ as CSV.
+        """Download FIRMS data, skipping date intervals already retained in raw CSVs.
+
+        Existing files are checked before each API request. Overlapping files are
+        treated as a union, so daily operational refreshes download only uncovered
+        days rather than repeating the whole season.
         """
         map_key = os.getenv("FIRMS_MAP_KEY")
         if not map_key:
@@ -50,8 +81,8 @@ class FIRMSSource(DataSource):
         bbox_list = self.config["algeria"]["bbox"]
         bbox = ",".join(str(x) for x in bbox_list)
 
-        sensors = self.config["firms"]["sensors"]
-
+        sensors = self.config["sensors"]
+        
         if not start_date:
             start_date = datetime.today().strftime("%Y-%m-%d")
         if not end_date:
@@ -66,43 +97,82 @@ class FIRMSSource(DataSource):
             f"({total_days} days, {len(sensors)} sensors)"
         )
 
-        existing = list(self.raw_dir.glob("*.csv"))
-        if existing:
-            self.logger.info(
-                f"Found {len(existing)} existing CSV(s) in data/raw/firms/ — "
-                f"skipping API ingestion. Delete raw files to force re-download."
-            )
-            return
+        self.raw_dir.mkdir(parents=True, exist_ok=True)
 
         fire_months = self.config.get("training", {}).get(
             "fire_season_months", list(range(1, 13))
         )
 
         for sensor in sensors:
-            all_dfs     = []
+            all_dfs = []
             chunk_start = start
+
+            # Training runs commonly request the same complete historical range
+            # repeatedly. If that exact non-empty file exists, skip the sensor
+            # immediately instead of scanning thousands of already-covered days.
+            exact_out = self.raw_dir / (
+                f"firms_{sensor.lower()}_{start_date}_{end_date}.csv"
+            )
+            if exact_out.exists() and exact_out.stat().st_size > 100:
+                self.logger.info(
+                    f"{sensor}: exact requested file already exists; "
+                    f"skipping download ({exact_out.name})"
+                )
+                continue
+
+            existing = self._existing_intervals(sensor)
+            if existing:
+                self.logger.info(
+                    f"{sensor}: found {len(existing)} retained raw file(s); "
+                    "covered intervals will be skipped"
+                )
 
             with tqdm(total=total_days, desc=f"{sensor}", unit="days") as pbar:
                 while chunk_start <= end:
-
                     if chunk_start.month not in fire_months:
                         if chunk_start.month == 12:
-                            next_month = chunk_start.replace(year=chunk_start.year + 1, month=1, day=1)
+                            next_month = chunk_start.replace(
+                                year=chunk_start.year + 1, month=1, day=1
+                            )
                         else:
-                            next_month = chunk_start.replace(month=chunk_start.month + 1, day=1)
-                        skipped = (next_month - chunk_start).days
+                            next_month = chunk_start.replace(
+                                month=chunk_start.month + 1, day=1
+                            )
+                        skipped = min((next_month - chunk_start).days, (end - chunk_start).days + 1)
                         pbar.update(skipped)
                         chunk_start = next_month
                         continue
 
-                    chunk_end = min(
-                        chunk_start + timedelta(days=self.MAX_DAYS_ARCH - 1),
-                        end
-                    )
-                    n_days   = (chunk_end - chunk_start).days + 1
-                    date_str = chunk_start.strftime("%Y-%m-%d")
-                    url      = f"{self.BASE_URL}/{map_key}/{sensor}/{bbox}/{n_days}/{date_str}"
+                    # Skip already-covered days before constructing an API request.
+                    if self._covered(chunk_start.date(), existing):
+                        skip_start = chunk_start
+                        while (
+                            chunk_start <= end
+                            and chunk_start.month in fire_months
+                            and self._covered(chunk_start.date(), existing)
+                        ):
+                            chunk_start += timedelta(days=1)
+                        pbar.update((chunk_start - skip_start).days)
+                        self.logger.debug(
+                            f"{sensor}: skipped retained coverage "
+                            f"{skip_start:%Y-%m-%d} → {chunk_start - timedelta(days=1):%Y-%m-%d}"
+                        )
+                        continue
 
+                    # Fetch at most five consecutive uncovered days. Stopping at
+                    # the next retained day prevents gaps/overlap assumptions.
+                    chunk_end = chunk_start
+                    while (
+                        chunk_end < end
+                        and (chunk_end - chunk_start).days + 1 < self.MAX_DAYS_ARCH
+                        and (chunk_end + timedelta(days=1)).month in fire_months
+                        and not self._covered((chunk_end + timedelta(days=1)).date(), existing)
+                    ):
+                        chunk_end += timedelta(days=1)
+
+                    n_days = (chunk_end - chunk_start).days + 1
+                    date_str = chunk_start.strftime("%Y-%m-%d")
+                    url = f"{self.BASE_URL}/{map_key}/{sensor}/{bbox}/{n_days}/{date_str}"
                     try:
                         df = pd.read_csv(url)
                         if not df.empty:
@@ -118,9 +188,14 @@ class FIRMSSource(DataSource):
 
             if all_dfs:
                 combined = pd.concat(all_dfs, ignore_index=True)
-                out      = self.raw_dir / f"firms_{sensor.lower()}_{start_date}_{end_date}.csv"
-                combined.to_csv(out, index=False)
-                self.logger.info(f"Saved {len(combined)} rows → {out.name}")
+                out = self.raw_dir / f"firms_{sensor.lower()}_{start_date}_{end_date}.csv"
+                if out.exists() and out.stat().st_size > 100:
+                    self.logger.info(f"Raw output already exists — keeping {out.name}")
+                else:
+                    combined.to_csv(out, index=False)
+                    self.logger.info(f"Saved {len(combined)} rows → {out.name}")
+            elif existing:
+                self.logger.info(f"{sensor}: no download needed; retained raw files cover the request")
             else:
                 self.logger.warning(f"No data returned for {sensor}")
 
