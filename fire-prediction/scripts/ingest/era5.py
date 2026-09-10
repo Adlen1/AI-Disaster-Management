@@ -381,6 +381,37 @@ class ERA5Source(DataSource):
         "volumetric_soil_water_layer_1",
     ]
 
+    def _max_time_in_file(self, nc_file: Path):
+        """Return the latest timestamp actually present in an ERA5 NetCDF file."""
+        try:
+            with xr.open_dataset(nc_file, engine="netcdf4") as ds:
+                if "time" in ds.coords:
+                    time_name = "time"
+                elif "valid_time" in ds.coords:
+                    time_name = "valid_time"
+                else:
+                    self.logger.warning(
+                        f"{nc_file.name}: no time coordinate found"
+                    )
+                    return None
+
+                values = pd.to_datetime(ds[time_name].values, errors="coerce")
+                if len(values) == 0:
+                    return None
+
+                latest = pd.Timestamp(values.max())
+                if pd.isna(latest):
+                    return None
+
+                return latest.date()
+
+        except Exception as exc:
+            self.logger.warning(
+                f"Could not inspect {nc_file.name}: {exc}"
+            )
+            return None
+
+
     def ingest(self, start_date: str = None, end_date: str = None):
         """
         - Download ERA5 monthly NetCDF files for Algeria.
@@ -437,23 +468,51 @@ class ERA5Source(DataSource):
             out_file = self.raw_dir / f"era5_{year_str}{month_str}.nc"
 
             today = datetime.today()
-            is_current_month = (current.year == today.year and current.month == today.month)
-
-            if out_file.exists() and not zipfile.is_zipfile(out_file) and not is_current_month:
-                self.logger.info(f"Already exists (closed month) — skipping {out_file.name}")
-                current += relativedelta(months=1)
-                continue
-            elif out_file.exists() and is_current_month:
-                self.logger.info(f"Current month {out_file.name} — re-downloading to include latest days")
-                out_file.unlink()  # delete stale file before re-download
+            is_current_month = (
+                current.year == today.year
+                and current.month == today.month
+            )
 
             next_month = current + relativedelta(months=1)
             month_last_day = (next_month - timedelta(days=1)).day
-         
+
             if current.year == end.year and current.month == end.month:
                 last_day = min(month_last_day, end.day)
             else:
                 last_day = month_last_day
+
+            required_end = datetime(
+                current.year,
+                current.month,
+                last_day,
+            ).date()
+
+            if out_file.exists() and not zipfile.is_zipfile(out_file):
+                if is_current_month:
+                    self.logger.info(
+                        f"Current month {out_file.name} — "
+                        "re-downloading to include latest days"
+                    )
+                    out_file.unlink()
+                else:
+                    actual_end = self._max_time_in_file(out_file)
+
+                    if actual_end is not None and actual_end >= required_end:
+                        self.logger.info(
+                            f"Already complete — {out_file.name} covers "
+                            f"through {actual_end}"
+                        )
+                        current += relativedelta(months=1)
+                        continue
+
+                    self.logger.warning(
+                        f"Incomplete cached file {out_file.name}: "
+                        f"ends {actual_end}, requested through {required_end}; "
+                        "refreshing"
+                    )
+                    out_file.unlink()
+
+            
             days = [f"{d:02d}" for d in range(1, last_day + 1)]
             all_hours = [f"{h:02d}:00" for h in range(24)]
 

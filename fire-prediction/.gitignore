@@ -80,5 +80,35 @@ notebooks/catboost_info
 logs/**
 !logs/.gitkeep
 
+# =====================================================
+# Node / Next.js
+# =====================================================
+web/node_modules/
+web/.next/
+web/.env.local
+web/.env*.local
+web/next-env.d.ts
+
+# =====================================================
+# Python build / packaging
+# =====================================================
+*.egg-info/
+.pytest_cache/
+dist/
+build/
+*.egg
+
+# =====================================================
+# Model artifacts (large binaries — use DVC or similar)
+# =====================================================
+*.pkl
+*.cbm
+*.joblib
+
+
+# =====================================================
+# ERA5 credentials
+# =====================================================
+.cdsapirc
 
 ../Fire/

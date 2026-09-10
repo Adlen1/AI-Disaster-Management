@@ -1,0 +1,182 @@
+@import url("https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600;700&display=swap");
+@import url("https://unpkg.com/leaflet@1.9.4/dist/leaflet.css");
+@import "tailwindcss";
+
+@theme inline {
+  --color-canvas:       var(--canvas);
+  --color-surface:      var(--surface);
+  --color-surface-muted: var(--surface-muted);
+  --color-ink:          var(--ink);
+  --color-ink-muted:    var(--ink-muted);
+  --color-ink-subtle:   var(--ink-subtle);
+  --color-line:         var(--line);
+  --color-brand:        var(--brand);
+  --color-brand-strong: var(--brand-strong);
+  --color-safe:         var(--safe);
+  --color-watch:        var(--watch);
+  --color-danger:       var(--danger);
+  /* tighter radii: containers are square, controls are slightly rounded */
+  --radius-panel:   0px;
+  --radius-control: 4px;
+  --shadow-panel:   none;
+  --font-mono: 'DM Mono', ui-monospace, monospace;
+}
+
+:root {
+  --canvas:       #f2f4f2;
+  --surface:      #ffffff;
+  --surface-muted:#eaeeeb;
+  --ink:          #111a15;
+  --ink-muted:    #4d5e53;
+  --ink-subtle:   #7a8e80;
+  --line:         #d0d9d2;
+  --brand:        #196b4b;
+  --brand-strong: #0f5238;
+  --safe:         #2f9364;
+  --watch:        #c47d10;
+  --danger:       #b83f3a;
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --canvas:       #0a100d;
+  --surface:      #101a14;
+  --surface-muted:#172019;
+  --ink:          #eef4ef;
+  --ink-muted:    #a8bfad;
+  --ink-subtle:   #6b8472;
+  --line:         #243329;
+  --brand:        #55bb85;
+  --brand-strong: #7dd4a4;
+  --safe:         #55bb85;
+  --watch:        #dba040;
+  --danger:       #e06b65;
+  color-scheme: dark;
+}
+
+@layer base {
+  *, ::before, ::after { box-sizing: border-box; }
+  html, body {
+    min-width: 320px;
+    min-height: 100%;
+    margin: 0;
+    background: var(--canvas);
+    color: var(--ink);
+  }
+  body {
+    font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+    font-size: 14px;
+    line-height: 1.55;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+  }
+  button, input, select { font: inherit; }
+  button { cursor: pointer; }
+}
+
+/* ── Mono data class ── */
+.font-data {
+  font-family: 'DM Mono', ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+/* ── Divider ── */
+.divider {
+  border: none;
+  border-top: 1px solid var(--line);
+}
+
+/* ── Risk accent bar on list rows ── */
+.risk-bar-high   { border-left: 3px solid var(--danger); }
+.risk-bar-mod    { border-left: 3px solid var(--watch);  }
+.risk-bar-low    { border-left: 3px solid var(--safe);   }
+
+/* ── Leaflet overrides ── */
+.leaflet-container {
+  min-height: 430px;
+  background: var(--surface-muted);
+  color: var(--ink);
+  font: inherit;
+}
+.leaflet-control-zoom,
+.leaflet-control-attribution,
+.leaflet-tooltip {
+  border: 1px solid var(--line) !important;
+  background: var(--surface) !important;
+  color: var(--ink) !important;
+  box-shadow: 0 4px 14px rgb(10 30 20 / 14%) !important;
+  border-radius: 2px !important;
+}
+.leaflet-control-zoom a {
+  border-color: var(--line) !important;
+  background: var(--surface) !important;
+  color: var(--ink) !important;
+}
+.leaflet-control-zoom a:hover {
+  background: var(--surface-muted) !important;
+  color: var(--brand) !important;
+}
+.leaflet-tooltip {
+  padding: 8px 11px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+/* ── Animations ── */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0);    }
+}
+@keyframes slideRight {
+  from { opacity: 0; transform: translateX(-6px); }
+  to   { opacity: 1; transform: translateX(0);    }
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1;   }
+  50%       { opacity: 0.4; }
+}
+
+/* Applied via class */
+.animate-fade    { animation: fadeIn   0.2s ease both; }
+.animate-up      { animation: slideUp  0.22s ease both; }
+.animate-right   { animation: slideRight 0.18s ease both; }
+.animate-pulse-slow { animation: pulse 1.8s ease-in-out infinite; }
+
+/* Staggered children: add .stagger to a parent, direct children get delay */
+.stagger > *:nth-child(1)  { animation-delay: 0ms;   }
+.stagger > *:nth-child(2)  { animation-delay: 40ms;  }
+.stagger > *:nth-child(3)  { animation-delay: 80ms;  }
+.stagger > *:nth-child(4)  { animation-delay: 120ms; }
+.stagger > *:nth-child(5)  { animation-delay: 160ms; }
+.stagger > *:nth-child(6)  { animation-delay: 200ms; }
+.stagger > *:nth-child(7)  { animation-delay: 240ms; }
+
+/* Smooth bar widths (SHAP bars, prob bars, wilaya share bars) */
+.bar-animate {
+  transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Row hover lift */
+.row-hover {
+  transition: background-color 0.12s ease, transform 0.12s ease;
+}
+.row-hover:hover {
+  transform: translateX(2px);
+}
+
+/* View switch crossfade */
+.view-enter {
+  animation: fadeIn 0.18s ease both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .leaflet-fade-anim .leaflet-tile,
+  .leaflet-zoom-animated { transition: none !important; }
+  .animate-fade, .animate-up, .animate-right,
+  .animate-pulse-slow, .bar-animate, .row-hover { animation: none !important; transition: none !important; }
+}
