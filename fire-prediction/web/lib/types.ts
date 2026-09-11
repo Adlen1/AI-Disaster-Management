@@ -25,6 +25,38 @@ export type DailySummary = { HIGH: number; MODERATE: number; LOW: number; total:
 export type WilayaStats = { wilaya_name: string; HIGH: number; MODERATE: number; LOW: number; total: number; elevated?: number; elevated_share?: number; average_urgency?: number; fire_detections?: number };
 export type HistoricalNationalPoint = { date: string; HIGH: number; MODERATE: number; LOW: number; total: number };
 export type HistoricalCommunePoint = { date: string; commune_id: string; risk_label?: string | null; prob_high?: number | null; urgency_score?: number | null };
-export type RunStatus = { last_successful_run?: string | null; overall_status?: string | null; model_version?: string | null; last_training_date?: string | null; message?: string | null; prediction_date?: string | null; target_date?: string | null; commune_count?: number | null; weather_staleness_days?: number | null; data_quality_status?: string | null; sources?: Record<string, unknown>; [key: string]: unknown };
-export type GeoJsonFeature = { properties?: Record<string, unknown>; geometry?: { type: string; coordinates: unknown } | null };
+export type RunStatus = {
+  last_successful_run?: string | null;
+  overall_status?: string | null;
+  model_version?: string | null;
+  last_training_date?: string | null;
+  message?: string | null;
+  prediction_date?: string | null;
+  target_date?: string | null;
+  commune_count?: number | null;
+  weather_staleness_days?: number | null;
+  data_quality_status?: string | null;
+
+  sources?: {
+    firms?: {
+      status?: "ok" | "degraded";
+      last_observation_date?: string | null;
+      staleness_days?: number;
+    };
+    era5?: {
+      status?: "ok" | "degraded";
+      last_observation_date?: string | null;
+      staleness_days?: number;
+      structural_lag_days?: number;
+      note?: string;
+    };
+    sentinel?: {
+      status?: "ok" | "degraded";
+      last_observation_date?: string | null;
+      staleness_days?: number;
+    };
+  };
+
+  [key: string]: unknown;
+};export type GeoJsonFeature = { properties?: Record<string, unknown>; geometry?: { type: string; coordinates: unknown } | null };
 export type GeoJsonResponse = { type: "FeatureCollection"; features: GeoJsonFeature[]; metadata?: { boundary_source?: string; all_communes?: number; predicted_communes?: number; unpredicted_communes?: number; warning?: string; source?: string; prediction_date?: string | null; target_date?: string | null } };

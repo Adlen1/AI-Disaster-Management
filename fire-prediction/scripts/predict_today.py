@@ -53,6 +53,9 @@ FIRMS_DEGRADED_THRESH = 2    # days
 SENTINEL_DEGRADED_THRESH = 35  # days
 
 
+# ── Debug / inspection dumps ──────────────────────────────────────────────────
+DEBUG_DUMP = True   # set True to write intermediate CSVs on each run
+
 def progress(message: str):
     """Emit pipeline progress through the standard logging system."""
     logger.info(message)
@@ -529,14 +532,31 @@ def run(feature_date: pd.Timestamp, root: Path, config_path: Path):
     # actual ERA5 latest date. It is NOT overwritten later in this function.
     base = add_weather_features(base, communes, weather, mapping, feature_date)
 
+    serving   = resolve(root, cfg["paths"]["serving"])
+
+    # ── DEBUG: integrated snapshot (fire + weather, pre-baselines) ────────
+    if DEBUG_DUMP:
+        dump_path = serving / f"debug_integrated_{feature_date:%Y-%m-%d}.csv"
+        base.to_csv(dump_path, index=False)
+        progress(f"  [debug] integrated snapshot → {dump_path.name}")
+    # ─────────────────────────────────────────────────────────────────────
+
+
     progress("Joining Sentinel, static features, fire-rate, and anomaly baselines")
     base = add_baselines(base, engineered, static, sentinel, feature_date)
     base["frp_total"] = base["fire_count"] * base["mean_frp"]
 
+    # ── DEBUG: fully engineered feature matrix (everything the model sees) ─
+    if DEBUG_DUMP:
+        dump_path = serving / f"debug_engineered_{feature_date:%Y-%m-%d}.csv"
+        base.to_csv(dump_path, index=False)
+        progress(f"  [debug] engineered snapshot → {dump_path.name}")
+    # ─────────────────────────────────────────────────────────────────────
+
     # Stage 7: inference
     model_dir = resolve(root, cfg["paths"]["models"])
     xai_dir   = resolve(root, cfg["paths"]["xai"])
-    serving   = resolve(root, cfg["paths"]["serving"])
+    # serving   = resolve(root, cfg["paths"]["serving"])
     meta      = json.loads((model_dir / "tuning_meta.json").read_text())
     features  = meta["features"]
     missing   = [f for f in features if f not in base.columns]
@@ -565,6 +585,16 @@ def run(feature_date: pd.Timestamp, root: Path, config_path: Path):
     progress("Computing urgency scores and SHAP drivers for every modeled commune")
     base = add_urgency_and_shap(base, X, proba, preds, features, xai_dir, model)
 
+    # ── DEBUG: post-inference snapshot (predictions + SHAP + urgency) ─────
+    if DEBUG_DUMP:
+        dump_path = serving / f"debug_predictions_{feature_date:%Y-%m-%d}.csv"
+        # top_drivers is a list column — serialize it for CSV
+        debug_df = base.copy()
+        debug_df["top_drivers"] = debug_df["top_drivers"].apply(json.dumps)
+        debug_df.to_csv(dump_path, index=False)
+        progress(f"  [debug] predictions snapshot → {dump_path.name}")
+    # ─────────────────────────────────────────────────────────────────────
+    
     # Stage 9: annotate predictions
     base["prediction_date"]       = feature_date.strftime("%Y-%m-%d")
     base["target_date"]           = target_date.strftime("%Y-%m-%d")

@@ -23,11 +23,36 @@ function asPredictions(map: GeoJsonResponse | null): CommunePrediction[] {
     .filter((p) => p && typeof p.commune_id === "string" && typeof p.risk_label === "string");
 }
 
-function statusLabel(status: RunStatus | null, summary: DailySummary | null) {
-  const stale = summary?.weather_staleness_days ?? status?.weather_staleness_days ?? 0;
-  return stale > 0
-    ? { text: `Weather delayed — ${stale}d`, warn: true }
-    : { text: "Data current", warn: false };
+function statusLabel(status: RunStatus | null) {
+  if (!status) {
+    return { text: "Data status unavailable", warn: true };
+  }
+
+  const degradedSources: string[] = [];
+
+  if (status.sources?.firms?.status === "degraded") {
+    degradedSources.push("FIRMS");
+  }
+
+  if (status.sources?.era5?.status === "degraded") {
+    degradedSources.push("ERA5");
+  }
+
+  if (status.sources?.sentinel?.status === "degraded") {
+    degradedSources.push("Sentinel");
+  }
+
+  if (degradedSources.length > 0) {
+    return {
+      text: `${degradedSources.join(", ")} delayed`,
+      warn: true,
+    };
+  }
+
+  return {
+    text: "Data current",
+    warn: false,
+  };
 }
 
 /* ── Thin toolbar button ── */
@@ -237,8 +262,8 @@ function HomeContent() {
   const lastUpdated = status?.last_successful_run ?? summary?.prediction_date;
   const staleDays = summary?.weather_staleness_days ?? status?.weather_staleness_days;
   const metadata = map?.metadata;
-  const sl = statusLabel(status, summary);
-
+  const sl = statusLabel(status);
+  
   const filterProps = {
     query, setQuery, wilayaFilter, setWilayaFilter, riskFilter, setRiskFilter,
     priorityOnly, setPriorityOnly, clearFilters, wilayasAvailable,
